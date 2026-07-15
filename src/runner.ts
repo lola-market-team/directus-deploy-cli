@@ -18,11 +18,13 @@ import {
   reconcileOperationsPass1,
   reconcileOperationsPass2,
 } from "./reconcilers/operations.js";
+import { reconcileMigrations } from "./reconcilers/migrations.js";
 import { buildIdentity } from "./identity.js";
 
 export interface RunInput {
   target: string;
   paths: SnapshotPaths;
+  migrationsDir?: string;
   client: DirectusClient;
   opts: ApplyOptions;
   entities: Set<EntityKind>;
@@ -43,6 +45,19 @@ export function summarize(results: EntityResult[], target: string): RunReport {
 export async function run(input: RunInput): Promise<RunReport> {
   const snapshot = await loadSnapshot(input.paths);
   const results: EntityResult[] = [];
+
+  // Migrations first — they may introduce raw-SQL tables and columns that
+  // subsequent reconcilers reference. Idempotent (tracked per-file in
+  // lola_deploy_migrations on the target).
+  if (input.entities.has("migrations") && input.migrationsDir) {
+    results.push(
+      ...(await reconcileMigrations({
+        migrationsDir: input.migrationsDir,
+        client: input.client,
+        opts: input.opts,
+      })),
+    );
+  }
 
   // Order matters:
   //   collections → fields → relations   (schema, string keys)
