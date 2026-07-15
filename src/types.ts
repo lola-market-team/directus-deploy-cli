@@ -1,4 +1,10 @@
-export type EntityKind = "collections" | "fields" | "relations";
+export type EntityKind =
+  | "collections"
+  | "fields"
+  | "relations"
+  | "policies"
+  | "roles"
+  | "permissions";
 
 export interface EntityResult {
   kind: EntityKind;
@@ -14,7 +20,7 @@ export interface RunReport {
 }
 
 export interface DirectusClient {
-  get(path: string): Promise<Record<string, unknown> | null>;
+  get(path: string): Promise<Record<string, unknown> | Record<string, unknown>[] | null>;
   post(path: string, body: unknown): Promise<Record<string, unknown>>;
   patch(path: string, body: unknown): Promise<Record<string, unknown>>;
 }

@@ -5,7 +5,14 @@ import { formatHuman, formatJson } from "./report.js";
 import { createDirectusClient } from "./http.js";
 import type { ApplyOptions } from "./types.js";
 
-const KNOWN_ENTITIES = ["collections", "fields", "relations"] as const;
+const KNOWN_ENTITIES = [
+  "collections",
+  "fields",
+  "relations",
+  "roles",
+  "policies",
+  "permissions",
+] as const;
 type Entity = (typeof KNOWN_ENTITIES)[number];
 
 interface CommonFlags {
@@ -15,6 +22,7 @@ interface CommonFlags {
   entities: string;
   onlyCollections?: string;
   snapshotDir: string;
+  configDir: string;
   registerDir: string;
   json?: boolean;
 }
@@ -41,6 +49,7 @@ function readCommon(flags: CommonFlags): {
   entities: Set<Entity>;
   onlyCollections?: Set<string>;
   snapshotDir: string;
+  configDir: string;
   registerDir: string;
   json: boolean;
 } {
@@ -60,6 +69,7 @@ function readCommon(flags: CommonFlags): {
     entities,
     onlyCollections,
     snapshotDir: flags.snapshotDir,
+    configDir: flags.configDir,
     registerDir: flags.registerDir,
     json: Boolean(flags.json),
   };
@@ -71,8 +81,11 @@ async function execute(dryRun: boolean, flags: CommonFlags): Promise<number> {
   const opts: ApplyOptions = { dryRun, onlyCollections: common.onlyCollections };
   const report = await run({
     target: common.target,
-    snapshotDir: common.snapshotDir,
-    registerDir: common.registerDir,
+    paths: {
+      snapshotDir: common.snapshotDir,
+      configDir: common.configDir,
+      registerDir: common.registerDir,
+    },
     client,
     opts,
     entities: common.entities,
@@ -108,6 +121,11 @@ function attachCommon(cmd: Command): Command {
       "--snapshot-dir <path>",
       "path to directus_config/snapshot",
       "./directus_config/snapshot",
+    )
+    .option(
+      "--config-dir <path>",
+      "path to directus_config/collections (holds policies.json, permissions.json, roles.json, …)",
+      "./directus_config/collections",
     )
     .option(
       "--register-dir <path>",

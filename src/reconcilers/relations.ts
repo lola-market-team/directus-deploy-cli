@@ -21,7 +21,8 @@ export async function reconcileRelations(
 
       let existing: Record<string, unknown> | null;
       try {
-        existing = await input.client.get(`/relations/${collection}/${field}`);
+        const got = await input.client.get(`/relations/${collection}/${field}`);
+        existing = Array.isArray(got) ? null : got;
       } catch (e) {
         results.push({ kind: "relations", label, action: "failed", reason: (e as Error).message });
         continue;

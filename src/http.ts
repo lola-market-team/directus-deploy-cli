@@ -49,6 +49,7 @@ export function createDirectusClient(cfg: DirectusHttpConfig): DirectusClient {
       if (!r.ok) throw toErr(r.url, r.status, await r.text());
       const j = await readJson(r);
       const data = (j as { data?: unknown }).data;
+      if (Array.isArray(data)) return data as Record<string, unknown>[];
       return data && typeof data === "object" ? (data as Record<string, unknown>) : null;
     },
     async post(path, body) {

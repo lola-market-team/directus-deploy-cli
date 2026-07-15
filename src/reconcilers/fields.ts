@@ -34,7 +34,8 @@ export async function reconcileFields(input: FieldReconcileInput): Promise<Entit
 
       let existing: Record<string, unknown> | null;
       try {
-        existing = await input.client.get(`/fields/${collection}/${field}`);
+        const got = await input.client.get(`/fields/${collection}/${field}`);
+        existing = Array.isArray(got) ? null : got;
       } catch (e) {
         results.push({ kind: "fields", label, action: "failed", reason: (e as Error).message });
         continue;

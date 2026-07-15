@@ -34,7 +34,8 @@ export async function reconcileCollections(
 
     let existing: Record<string, unknown> | null;
     try {
-      existing = await input.client.get(`/collections/${name}`);
+      const got = await input.client.get(`/collections/${name}`);
+      existing = Array.isArray(got) ? null : got;
     } catch (e) {
       results.push({
         kind: "collections",
