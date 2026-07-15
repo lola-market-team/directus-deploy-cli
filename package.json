@@ -1,0 +1,30 @@
+{
+  "name": "@lola/deploy",
+  "version": "0.1.0",
+  "description": "First-class Directus deployment tool. Reconciles code + config to any env, per-entity, non-atomic.",
+  "type": "module",
+  "bin": {
+    "lola-deploy": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "test": "vitest run",
+    "test:live": "vitest run --config vitest.live.config.ts",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

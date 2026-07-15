@@ -1,0 +1,75 @@
+import type { DirectusClient } from "./types.js";
+
+// Thin fetch-based Directus REST client. No id resolution — that's per-reconciler.
+// GET returns null on 404 OR 403 (Directus hides existence via permission).
+
+export interface DirectusHttpConfig {
+  baseUrl: string;
+  token: string;
+  fetch?: typeof globalThis.fetch;
+}
+
+export interface DirectusError extends Error {
+  status: number;
+  body: string;
+}
+
+function toErr(url: string, status: number, body: string): DirectusError {
+  const e = new Error(`${status} ${url} :: ${body}`) as DirectusError;
+  e.status = status;
+  e.body = body;
+  return e;
+}
+
+export function createDirectusClient(cfg: DirectusHttpConfig): DirectusClient {
+  const base = cfg.baseUrl.replace(/\/+$/, "");
+  const fetchImpl = cfg.fetch ?? globalThis.fetch;
+  const headers: HeadersInit = {
+    Authorization: `Bearer ${cfg.token}`,
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+
+  async function readJson(r: Response): Promise<Record<string, unknown>> {
+    if (r.status === 204) return {};
+    const text = await r.text();
+    if (!text) return {};
+    try {
+      const j = JSON.parse(text);
+      return (j && typeof j === "object" ? (j as Record<string, unknown>) : {}) ?? {};
+    } catch {
+      throw toErr(r.url, r.status, text);
+    }
+  }
+
+  return {
+    async get(path) {
+      const r = await fetchImpl(base + path, { headers });
+      if (r.status === 404 || r.status === 403) return null;
+      if (!r.ok) throw toErr(r.url, r.status, await r.text());
+      const j = await readJson(r);
+      const data = (j as { data?: unknown }).data;
+      return data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+    },
+    async post(path, body) {
+      const r = await fetchImpl(base + path, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body ?? {}),
+      });
+      if (!r.ok) throw toErr(r.url, r.status, await r.text());
+      const j = await readJson(r);
+      return ((j as { data?: unknown }).data as Record<string, unknown>) ?? {};
+    },
+    async patch(path, body) {
+      const r = await fetchImpl(base + path, {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify(body ?? {}),
+      });
+      if (!r.ok) throw toErr(r.url, r.status, await r.text());
+      const j = await readJson(r);
+      return ((j as { data?: unknown }).data as Record<string, unknown>) ?? {};
+    },
+  };
+}
