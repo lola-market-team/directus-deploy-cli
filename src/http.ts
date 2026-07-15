@@ -72,5 +72,14 @@ export function createDirectusClient(cfg: DirectusHttpConfig): DirectusClient {
       const j = await readJson(r);
       return ((j as { data?: unknown }).data as Record<string, unknown>) ?? {};
     },
+    async postRaw(path, body) {
+      const r = await fetchImpl(base + path, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body ?? {}),
+      });
+      if (!r.ok) throw toErr(r.url, r.status, await r.text());
+      return await readJson(r);
+    },
   };
 }

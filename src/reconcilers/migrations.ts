@@ -37,7 +37,7 @@ interface RawQueryResult {
 
 async function rawQuery(client: DirectusClient, sql: string): Promise<RawQueryResult | null> {
   try {
-    const r = (await client.post("/raw-query/execute", { query: sql })) as unknown;
+    const r = (await client.postRaw("/raw-query/execute", { query: sql })) as unknown;
     if (r === null || typeof r !== "object") return null;
     return r as RawQueryResult;
   } catch (e) {

@@ -15,6 +15,7 @@ function mockClient(policies: unknown[], roles: unknown[]): DirectusClient {
     }),
     post: vi.fn(async () => ({})),
     patch: vi.fn(async () => ({})),
+    postRaw: vi.fn(async () => ({})),
   };
 }
 
