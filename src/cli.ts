@@ -15,6 +15,7 @@ const KNOWN_ENTITIES = [
   "flows",
   "operations",
   "migrations",
+  "seeds",
 ] as const;
 type Entity = (typeof KNOWN_ENTITIES)[number];
 
@@ -28,6 +29,7 @@ interface CommonFlags {
   configDir: string;
   registerDir: string;
   migrationsDir: string;
+  seedDir: string;
   json?: boolean;
 }
 
@@ -56,6 +58,7 @@ function readCommon(flags: CommonFlags): {
   configDir: string;
   registerDir: string;
   migrationsDir: string;
+  seedDir: string;
   json: boolean;
 } {
   const url = flags.url ?? process.env.DIRECTUS_URL;
@@ -77,6 +80,7 @@ function readCommon(flags: CommonFlags): {
     configDir: flags.configDir,
     registerDir: flags.registerDir,
     migrationsDir: flags.migrationsDir,
+    seedDir: flags.seedDir,
     json: Boolean(flags.json),
   };
 }
@@ -98,6 +102,7 @@ async function execute(mode: ExecuteOptions, flags: CommonFlags): Promise<number
       registerDir: common.registerDir,
     },
     migrationsDir: common.migrationsDir,
+    seedDir: common.seedDir,
     client,
     opts,
     entities: common.entities,
@@ -155,6 +160,11 @@ function attachCommon(cmd: Command): Command {
       "--register-dir <path>",
       "path to migrations/register",
       "./migrations/register",
+    )
+    .option(
+      "--seed-dir <path>",
+      "path to directus_config/seed (Tractr-style {collection, meta, data} files)",
+      "./directus_config/seed",
     )
     .option(
       "--migrations-dir <path>",

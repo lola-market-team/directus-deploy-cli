@@ -20,12 +20,14 @@ import {
 } from "./reconcilers/operations.js";
 import { reconcileMigrations } from "./reconcilers/migrations.js";
 import { reconcileRegister } from "./reconcilers/register.js";
+import { reconcileSeeds } from "./reconcilers/seeds.js";
 import { buildIdentity } from "./identity.js";
 
 export interface RunInput {
   target: string;
   paths: SnapshotPaths;
   migrationsDir?: string;
+  seedDir?: string;
   client: DirectusClient;
   opts: ApplyOptions;
   entities: Set<EntityKind>;
@@ -233,6 +235,18 @@ export async function run(input: RunInput): Promise<RunReport> {
         );
       }
     }
+  }
+
+  // Seed data — data-tables (messaging_templates, notification_types, …). Runs
+  // last so any referenced collections/policies/flows exist first.
+  if (input.entities.has("seeds") && input.seedDir) {
+    results.push(
+      ...(await reconcileSeeds({
+        seedDir: input.seedDir,
+        client: input.client,
+        opts: input.opts,
+      })),
+    );
   }
 
   return summarize(results, input.target);

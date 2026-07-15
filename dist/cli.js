@@ -13,6 +13,7 @@ const KNOWN_ENTITIES = [
     "flows",
     "operations",
     "migrations",
+    "seeds",
 ];
 function parseEntities(csv) {
     const parts = csv
@@ -50,6 +51,7 @@ function readCommon(flags) {
         configDir: flags.configDir,
         registerDir: flags.registerDir,
         migrationsDir: flags.migrationsDir,
+        seedDir: flags.seedDir,
         json: Boolean(flags.json),
     };
 }
@@ -65,6 +67,7 @@ async function execute(mode, flags) {
             registerDir: common.registerDir,
         },
         migrationsDir: common.migrationsDir,
+        seedDir: common.seedDir,
         client,
         opts,
         entities: common.entities,
@@ -103,6 +106,7 @@ function attachCommon(cmd) {
         .option("--snapshot-dir <path>", "path to directus_config/snapshot", "./directus_config/snapshot")
         .option("--config-dir <path>", "path to directus_config/collections (holds policies.json, permissions.json, roles.json, …)", "./directus_config/collections")
         .option("--register-dir <path>", "path to migrations/register", "./migrations/register")
+        .option("--seed-dir <path>", "path to directus_config/seed (Tractr-style {collection, meta, data} files)", "./directus_config/seed")
         .option("--migrations-dir <path>", "path to migrations/*.sql (raw SQL, tracked in lola_deploy_migrations)", "./migrations")
         .option("--json", "emit JSON report instead of human-readable");
 }

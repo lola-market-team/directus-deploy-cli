@@ -7,7 +7,8 @@ export type EntityKind =
   | "permissions"
   | "flows"
   | "operations"
-  | "migrations";
+  | "migrations"
+  | "seeds";
 
 export interface EntityResult {
   kind: EntityKind;

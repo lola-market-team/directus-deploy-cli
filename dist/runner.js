@@ -9,6 +9,7 @@ import { reconcileFlowsPass1, reconcileFlowsPass2 } from "./reconcilers/flows.js
 import { reconcileOperationsPass1, reconcileOperationsPass2, } from "./reconcilers/operations.js";
 import { reconcileMigrations } from "./reconcilers/migrations.js";
 import { reconcileRegister } from "./reconcilers/register.js";
+import { reconcileSeeds } from "./reconcilers/seeds.js";
 import { buildIdentity } from "./identity.js";
 export function summarize(results, target) {
     const counts = {
@@ -144,6 +145,15 @@ export async function run(input) {
                 })));
             }
         }
+    }
+    // Seed data — data-tables (messaging_templates, notification_types, …). Runs
+    // last so any referenced collections/policies/flows exist first.
+    if (input.entities.has("seeds") && input.seedDir) {
+        results.push(...(await reconcileSeeds({
+            seedDir: input.seedDir,
+            client: input.client,
+            opts: input.opts,
+        })));
     }
     return summarize(results, input.target);
 }
