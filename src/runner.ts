@@ -1,21 +1,26 @@
 import type {
   ApplyOptions,
   DirectusClient,
+  EntityKind,
   EntityResult,
   RunReport,
 } from "./types.js";
 import { loadSnapshot } from "./manifest.js";
+import type { SnapshotPaths } from "./manifest.js";
 import { reconcileCollections } from "./reconcilers/collections.js";
 import { reconcileFields } from "./reconcilers/fields.js";
 import { reconcileRelations } from "./reconcilers/relations.js";
+import { reconcileRoles } from "./reconcilers/roles.js";
+import { reconcilePolicies } from "./reconcilers/policies.js";
+import { reconcilePermissions } from "./reconcilers/permissions.js";
+import { buildIdentity } from "./identity.js";
 
 export interface RunInput {
   target: string;
-  snapshotDir: string;
-  registerDir: string;
+  paths: SnapshotPaths;
   client: DirectusClient;
   opts: ApplyOptions;
-  entities: Set<"collections" | "fields" | "relations">;
+  entities: Set<EntityKind>;
 }
 
 export function summarize(results: EntityResult[], target: string): RunReport {
@@ -31,10 +36,12 @@ export function summarize(results: EntityResult[], target: string): RunReport {
 }
 
 export async function run(input: RunInput): Promise<RunReport> {
-  const snapshot = await loadSnapshot(input.snapshotDir, input.registerDir);
+  const snapshot = await loadSnapshot(input.paths);
   const results: EntityResult[] = [];
 
-  // Dependency order: collections → fields → relations.
+  // Order matters:
+  //   collections → fields → relations   (schema, string keys)
+  //   roles → policies → permissions     (auto-id, cross-refs by name)
   if (input.entities.has("collections")) {
     results.push(
       ...(await reconcileCollections({
@@ -64,5 +71,47 @@ export async function run(input: RunInput): Promise<RunReport> {
       })),
     );
   }
+
+  // Auto-id entities need an identity index built once, reused across kinds.
+  const needsIdentity =
+    input.entities.has("policies") ||
+    input.entities.has("permissions") ||
+    input.entities.has("roles");
+  if (needsIdentity) {
+    if (input.entities.has("roles")) {
+      results.push(
+        ...(await reconcileRoles({
+          roles: snapshot.roles,
+          client: input.client,
+          opts: input.opts,
+        })),
+      );
+    }
+    const identity = await buildIdentity(input.client, snapshot.policies, snapshot.roles);
+    if (input.entities.has("policies")) {
+      results.push(
+        ...(await reconcilePolicies({
+          policies: snapshot.policies,
+          identity,
+          client: input.client,
+          opts: input.opts,
+        })),
+      );
+    }
+    if (input.entities.has("permissions")) {
+      // Re-fetch identity so policies just created in the prior step are
+      // resolvable. Roles are usually stable, so we only refresh policies.
+      const refreshed = await buildIdentity(input.client, snapshot.policies, snapshot.roles);
+      results.push(
+        ...(await reconcilePermissions({
+          permissions: snapshot.permissions,
+          identity: refreshed,
+          client: input.client,
+          opts: input.opts,
+        })),
+      );
+    }
+  }
+
   return summarize(results, input.target);
 }
