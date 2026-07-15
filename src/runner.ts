@@ -19,6 +19,7 @@ import {
   reconcileOperationsPass2,
 } from "./reconcilers/operations.js";
 import { reconcileMigrations } from "./reconcilers/migrations.js";
+import { reconcileRegister } from "./reconcilers/register.js";
 import { buildIdentity } from "./identity.js";
 
 export interface RunInput {
@@ -53,6 +54,17 @@ export async function run(input: RunInput): Promise<RunReport> {
     results.push(
       ...(await reconcileMigrations({
         migrationsDir: input.migrationsDir,
+        client: input.client,
+        opts: input.opts,
+      })),
+    );
+    // Register manifests for raw-SQL adopted tables. Runs alongside migrations
+    // because the two are conceptually paired: a migration creates the raw
+    // table, its manifest teaches Directus about the columns. Piggy-backs on
+    // the `migrations` entity kind so callers don't need to opt in twice.
+    results.push(
+      ...(await reconcileRegister({
+        registerDir: input.paths.registerDir,
         client: input.client,
         opts: input.opts,
       })),

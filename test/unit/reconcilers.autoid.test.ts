@@ -10,6 +10,7 @@ function mkClient(overrides: Partial<DirectusClient> = {}): DirectusClient {
     get: vi.fn(async () => null),
     post: vi.fn(async () => ({})),
     patch: vi.fn(async () => ({})),
+    postRaw: vi.fn(async () => ({})),
     ...overrides,
   };
 }
