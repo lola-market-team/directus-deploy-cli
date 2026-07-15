@@ -16,6 +16,14 @@ export interface IdentityIndex {
   roleSyncIdToName: Map<string, string>;
   serverPolicyIdByName: Map<string, string>;
   serverRoleIdByName: Map<string, string>;
+  // Flows + operations. Operations don't have a name — their identity within
+  // a flow is the `key` field, and their identity across flows is
+  // (flow_name, key). We index server ops by (flow_id, key) since a client
+  // GET returns `flow` as the server flow id.
+  flowSyncIdToName: Map<string, string>;
+  serverFlowIdByName: Map<string, string>;
+  opSyncIdToFlowAndKey: Map<string, { flowSyncId: string; key: string }>;
+  serverOpIdByFlowIdAndKey: Map<string, string>; // key format: `${flowId}::${opKey}`
 }
 
 function collectNames(
@@ -60,20 +68,62 @@ function indexByName(
   return map;
 }
 
+function collectOpSyncIdIndex(
+  localOps: Record<string, unknown>[],
+): Map<string, { flowSyncId: string; key: string }> {
+  const map = new Map<string, { flowSyncId: string; key: string }>();
+  for (const op of localOps) {
+    const sync = String((op as { _syncId?: unknown })._syncId ?? "");
+    const flow = String((op as { flow?: unknown }).flow ?? "");
+    const key = String((op as { key?: unknown }).key ?? "");
+    if (sync && flow && key) map.set(sync, { flowSyncId: flow, key });
+  }
+  return map;
+}
+
+function indexServerOps(
+  serverOps: Record<string, unknown>[],
+): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const op of serverOps) {
+    const id = String((op as { id?: unknown }).id ?? "");
+    const flow = String((op as { flow?: unknown }).flow ?? "");
+    const key = String((op as { key?: unknown }).key ?? "");
+    if (id && flow && key) map.set(`${flow}::${key}`, id);
+  }
+  return map;
+}
+
 export async function buildIdentity(
   client: DirectusClient,
   localPolicies: Record<string, unknown>[],
   localRoles: Record<string, unknown>[],
+  localFlows: Record<string, unknown>[] = [],
+  localOps: Record<string, unknown>[] = [],
 ): Promise<IdentityIndex> {
-  const [serverPolicies, serverRoles] = await Promise.all([
+  const [serverPolicies, serverRoles, serverFlows, serverOps] = await Promise.all([
     listAll(client, "/policies"),
     listAll(client, "/roles"),
+    localFlows.length
+      ? client
+          .get("/flows?limit=-1&fields=id,name")
+          .then((r) => (Array.isArray(r) ? r : []))
+      : Promise.resolve([]),
+    localOps.length
+      ? client
+          .get("/operations?limit=-1&fields=id,flow,key")
+          .then((r) => (Array.isArray(r) ? r : []))
+      : Promise.resolve([]),
   ]);
   return {
     policySyncIdToName: collectNames(localPolicies),
     roleSyncIdToName: collectNames(localRoles),
     serverPolicyIdByName: indexByName(serverPolicies),
     serverRoleIdByName: indexByName(serverRoles),
+    flowSyncIdToName: collectNames(localFlows),
+    serverFlowIdByName: indexByName(serverFlows),
+    opSyncIdToFlowAndKey: collectOpSyncIdIndex(localOps),
+    serverOpIdByFlowIdAndKey: indexServerOps(serverOps),
   };
 }
 
@@ -93,4 +143,26 @@ export function resolveRoleSyncIdToServerId(
   const name = idx.roleSyncIdToName.get(syncId);
   if (!name) return null;
   return idx.serverRoleIdByName.get(name) ?? null;
+}
+
+export function resolveFlowSyncIdToServerId(
+  syncId: string,
+  idx: IdentityIndex,
+): string | null {
+  const name = idx.flowSyncIdToName.get(syncId);
+  if (!name) return null;
+  return idx.serverFlowIdByName.get(name) ?? null;
+}
+
+// Operation identity: local _syncId → (flow_syncId, key) → we resolve
+// flow_syncId → server flow id → look up server op by (flow_id, key).
+export function resolveOpSyncIdToServerId(
+  syncId: string,
+  idx: IdentityIndex,
+): string | null {
+  const local = idx.opSyncIdToFlowAndKey.get(syncId);
+  if (!local) return null;
+  const serverFlowId = resolveFlowSyncIdToServerId(local.flowSyncId, idx);
+  if (!serverFlowId) return null;
+  return idx.serverOpIdByFlowIdAndKey.get(`${serverFlowId}::${local.key}`) ?? null;
 }

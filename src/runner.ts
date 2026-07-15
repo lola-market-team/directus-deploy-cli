@@ -13,6 +13,11 @@ import { reconcileRelations } from "./reconcilers/relations.js";
 import { reconcileRoles } from "./reconcilers/roles.js";
 import { reconcilePolicies } from "./reconcilers/policies.js";
 import { reconcilePermissions } from "./reconcilers/permissions.js";
+import { reconcileFlowsPass1, reconcileFlowsPass2 } from "./reconcilers/flows.js";
+import {
+  reconcileOperationsPass1,
+  reconcileOperationsPass2,
+} from "./reconcilers/operations.js";
 import { buildIdentity } from "./identity.js";
 
 export interface RunInput {
@@ -72,11 +77,13 @@ export async function run(input: RunInput): Promise<RunReport> {
     );
   }
 
-  // Auto-id entities need an identity index built once, reused across kinds.
+  // Auto-id entities need an identity index built once per phase.
   const needsIdentity =
     input.entities.has("policies") ||
     input.entities.has("permissions") ||
-    input.entities.has("roles");
+    input.entities.has("roles") ||
+    input.entities.has("flows") ||
+    input.entities.has("operations");
   if (needsIdentity) {
     if (input.entities.has("roles")) {
       results.push(
@@ -87,29 +94,117 @@ export async function run(input: RunInput): Promise<RunReport> {
         })),
       );
     }
-    const identity = await buildIdentity(input.client, snapshot.policies, snapshot.roles);
+    const identity1 = await buildIdentity(
+      input.client,
+      snapshot.policies,
+      snapshot.roles,
+      snapshot.flows,
+      snapshot.operations,
+    );
     if (input.entities.has("policies")) {
       results.push(
         ...(await reconcilePolicies({
           policies: snapshot.policies,
-          identity,
+          identity: identity1,
           client: input.client,
           opts: input.opts,
         })),
       );
     }
     if (input.entities.has("permissions")) {
-      // Re-fetch identity so policies just created in the prior step are
-      // resolvable. Roles are usually stable, so we only refresh policies.
-      const refreshed = await buildIdentity(input.client, snapshot.policies, snapshot.roles);
+      // Re-fetch identity so policies just created are resolvable.
+      const identity2 = await buildIdentity(
+        input.client,
+        snapshot.policies,
+        snapshot.roles,
+        snapshot.flows,
+        snapshot.operations,
+      );
       results.push(
         ...(await reconcilePermissions({
           permissions: snapshot.permissions,
-          identity: refreshed,
+          identity: identity2,
           client: input.client,
           opts: input.opts,
         })),
       );
+    }
+
+    // Flows + operations: two-pass to break the mutual FK cycle.
+    if (input.entities.has("flows") || input.entities.has("operations")) {
+      const identityF = await buildIdentity(
+        input.client,
+        snapshot.policies,
+        snapshot.roles,
+        snapshot.flows,
+        snapshot.operations,
+      );
+
+      if (input.entities.has("flows")) {
+        results.push(
+          ...(await reconcileFlowsPass1({
+            flows: snapshot.flows,
+            identity: identityF,
+            client: input.client,
+            opts: input.opts,
+          })),
+        );
+      }
+
+      if (input.entities.has("operations")) {
+        // Refresh identity so newly-created flow ids become resolvable.
+        const identityO = await buildIdentity(
+          input.client,
+          snapshot.policies,
+          snapshot.roles,
+          snapshot.flows,
+          snapshot.operations,
+        );
+        results.push(
+          ...(await reconcileOperationsPass1({
+            operations: snapshot.operations,
+            identity: identityO,
+            client: input.client,
+            opts: input.opts,
+          })),
+        );
+        // Second pass on operations: resolve/reject refs.
+        const identityO2 = await buildIdentity(
+          input.client,
+          snapshot.policies,
+          snapshot.roles,
+          snapshot.flows,
+          snapshot.operations,
+        );
+        results.push(
+          ...(await reconcileOperationsPass2({
+            operations: snapshot.operations,
+            identity: identityO2,
+            client: input.client,
+            opts: input.opts,
+          })),
+        );
+      }
+
+      if (input.entities.has("flows")) {
+        // Final pass on flows: link each flow's entry `operation` to its
+        // freshly-reconciled server op id.
+        const identityFinal = await buildIdentity(
+          input.client,
+          snapshot.policies,
+          snapshot.roles,
+          snapshot.flows,
+          snapshot.operations,
+        );
+        results.push(
+          ...(await reconcileFlowsPass2({
+            flows: snapshot.flows,
+            identity: identityFinal,
+            client: input.client,
+            opts: input.opts,
+          })),
+        );
+      }
     }
   }
 
