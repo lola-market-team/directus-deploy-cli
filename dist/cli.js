@@ -93,7 +93,7 @@ async function execute(mode, flags) {
 }
 const program = new Command();
 program
-    .name("lola-deploy")
+    .name("directus-deploy")
     .description("Reconcile a Directus environment to the state described in directus_config/snapshot/. Per-entity, non-atomic.")
     .version("0.1.0");
 function attachCommon(cmd) {
@@ -126,7 +126,7 @@ attachCommon(program.command("verify"))
     process.exit(await execute({ dryRun: true, strict: true }, cmd.optsWithGlobals()));
 });
 program.parseAsync(process.argv).catch((e) => {
-    process.stderr.write(`lola-deploy: ${e.message}\n`);
+    process.stderr.write(`directus-deploy: ${e.message}\n`);
     process.exit(2);
 });
 //# sourceMappingURL=cli.js.map

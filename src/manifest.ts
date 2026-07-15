@@ -1,5 +1,5 @@
 // Load the snapshot files that describe the desired state. Reads the same
-// on-disk shape lola-market-backend already uses under directus_config/, so we
+// on-disk shape directus-sync-style repo uses under directus_config/, so we
 // can drop this tool into the existing repo without a migration.
 
 import { readdir, readFile } from "node:fs/promises";

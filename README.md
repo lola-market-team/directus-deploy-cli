@@ -1,62 +1,62 @@
-# lola-deploy
+# directus-deploy-cli
 
-First-class Directus deployment tool. Reconciles code + config from git to any Directus environment — per-entity, non-atomic. Replaces the `directus-sync` + `register-table.mjs` + `ds push` sprawl that made every deploy of the LOLA Market backend a firefight.
+Per-entity, non-atomic Directus deployment tool. Reconciles code + config from a git repository to any Directus environment. Handles collections, fields, relations, roles, policies, permissions, flows, operations, raw-SQL migrations, register manifests, and seed data.
 
-## Why
+## Why not the built-in schema apply?
 
-`directus-sync push` applies the whole schema atomically via `/schema/apply`. One edge case ("field already exists", "relationship already associated", dangling meta.group ref, adopted-but-unregistered raw-SQL column) blocks every other change. In a repo with many contributors, multiple environments (test / staging / prod), and raw-SQL adopted tables, that atomic model is a firefight generator.
+Directus's `/schema/apply` is atomic — one edge case ("field already exists", "relationship already associated", dangling `meta.group` ref, adopted-but-unregistered raw-SQL column) blocks every other change. In a repo with many contributors, multiple environments, and raw-SQL adopted tables, that atomic model becomes a firefight generator.
 
-`lola-deploy` iterates each entity independently: `GET → POST | PATCH | SKIP`, one entity fails, the other 900 still apply. Per-entity report tells you exactly what changed and why the skips/failures happened.
+`directus-deploy` iterates each entity independently: `GET → POST | PATCH | SKIP`. If one entity fails, the other 900 still apply. Per-entity report tells you exactly what changed and why the skips/failures happened.
 
 ## Install
 
 ```
-npm install -g @lola/deploy
+npm install -g directus-deploy-cli
 ```
 
-Or run without installing:
+## Use
 
 ```
-npx @lola/deploy@latest plan --url=... --token=...
+DIRECTUS_URL=https://your-directus DIRECTUS_TOKEN=... \
+  directus-deploy verify \
+    --snapshot-dir=./directus_config/snapshot \
+    --config-dir=./directus_config/collections \
+    --seed-dir=./directus_config/seed \
+    --migrations-dir=./migrations \
+    --register-dir=./migrations/register
 ```
 
-## Usage
+Commands: `plan` (dry-run report), `apply` (reconcile), `verify` (drift check; exits non-zero if apply would change anything).
+
+## MCP server
+
+Ships an MCP server exposing `directus_plan` / `directus_apply` / `directus_verify` as structured tools. Register in your Claude client's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "directus-deploy": {
+      "command": "node",
+      "args": ["<abs-path>/node_modules/directus-deploy-cli/dist/mcp-server.js"],
+      "env": { "DIRECTUS_URL": "...", "DIRECTUS_TOKEN": "..." }
+    }
+  }
+}
+```
+
+## On-disk layout
+
+Compatible with the `directus-sync`-style tree:
 
 ```
-# Dry-run: show what would change against test, no writes
-DIRECTUS_URL=https://test.lola.market DIRECTUS_TOKEN=... \
-  lola-deploy plan
-
-# Apply: reconcile the env
-DIRECTUS_URL=https://test.lola.market DIRECTUS_TOKEN=... \
-  lola-deploy apply
-
-# Machine-readable JSON output (for CI reports)
-lola-deploy plan --json
-
-# Restrict to a subset
-lola-deploy apply --entities=collections,fields --only-collections=listings,rentals
+directus_config/
+  snapshot/{collections,fields,relations}/*.json
+  collections/{roles,policies,permissions,flows,operations}.json
+  seed/*.json
+migrations/*.sql
+migrations/register/*.json
 ```
-
-Points at `./directus_config/snapshot/` and `./migrations/register/` by default. Override with `--snapshot-dir` / `--register-dir`.
-
-## Milestones
-
-- **M1 (this release)** — collections, fields, relations. String-keyed, no id resolution needed. Three-tier collection model (managed / adopted / external).
-- M2 — permissions, policies, roles. Composite-key resolution.
-- M3 — flows, operations. Two-pass for `resolve` / `reject` references.
-- M4 — migrations + register-table.mjs + extensions.
-- M5 — wire into CI, retire `directus-sync`.
-- M6 — manifest generator, retire `directus_config/snapshot/`.
-
-## Design principles
-
-1. **Non-atomic.** One drift never blocks 900 clean entities.
-2. **Idempotent.** `apply` twice in a row: second run reports 0 changes.
-3. **Multi-writer safe.** Adopted-but-unregistered raw-SQL columns are detected and skipped, not silently promoted into Directus-managed state.
-4. **Local-first.** The same command runs against test in seconds on a laptop, no CI dependency.
-5. **Observable.** JSON report is the source of truth for CI. Human-readable output is a formatter over the same data.
 
 ## License
 
-Private, LOLA Market team internal.
+MIT

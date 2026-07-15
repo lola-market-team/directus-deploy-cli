@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// MCP server wrapping lola-deploy's reconciler graph. Speaks the Model
+// MCP server wrapping directus-deploy's reconciler graph. Speaks the Model
 // Context Protocol on stdio so any MCP-aware Claude client (Chrome
 // extension, Code CLI, Desktop, Claude in Cursor, …) can call plan/apply/
 // verify as structured tools instead of shelling out.
@@ -7,19 +7,19 @@
 // Usage in a Claude .mcp.json:
 //   {
 //     "mcpServers": {
-//       "lola-deploy": {
+//       "directus-deploy": {
 //         "command": "node",
-//         "args": ["<abs-path>/node_modules/@lola/deploy/dist/mcp-server.js"],
+//         "args": ["<abs-path>/node_modules/directus-deploy-cli/dist/mcp-server.js"],
 //         "env": { "DIRECTUS_URL": "...", "DIRECTUS_TOKEN": "..." }
 //       }
 //     }
 //   }
 //
 // Tools exposed:
-//   - lola.plan(target, entities?, only_collections?, snapshot_dir?, config_dir?,
+//   - directus_plan(target, entities?, only_collections?, snapshot_dir?, config_dir?,
 //     register_dir?, migrations_dir?, seed_dir?) — dry-run report.
-//   - lola.apply(...same shape...) — reconcile.
-//   - lola.verify(...same shape...) — drift check; error result when drift found.
+//   - directus_apply(...same shape...) — reconcile.
+//   - directus_verify(...same shape...) — drift check; error result when drift found.
 //
 // Each tool returns the JSON report (see src/types.ts RunReport).
 
@@ -171,26 +171,26 @@ async function handleVerify(args: CommonArgs): Promise<{
 
 async function main() {
   const server = new Server(
-    { name: "lola-deploy", version: "0.1.0" },
+    { name: "directus-deploy", version: "0.1.0" },
     { capabilities: { tools: {} } },
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       {
-        name: "lola_plan",
+        name: "directus_plan",
         description:
           "Dry-run against a Directus target: report what would change, no writes. Returns the full JSON report.",
         inputSchema: COMMON_INPUT_SCHEMA,
       },
       {
-        name: "lola_apply",
+        name: "directus_apply",
         description:
           "Reconcile the target env to match directus_config/. Per-entity, non-atomic — a single failure never aborts the run. Returns the full JSON report.",
         inputSchema: COMMON_INPUT_SCHEMA,
       },
       {
-        name: "lola_verify",
+        name: "directus_verify",
         description:
           "Post-apply drift check: dry-run then fail if any entity would be created or updated. Returns { report, drift } — drift > 0 means the target has diverged from git.",
         inputSchema: COMMON_INPUT_SCHEMA,
@@ -203,13 +203,13 @@ async function main() {
     try {
       let payload: unknown;
       switch (req.params.name) {
-        case "lola_plan":
+        case "directus_plan":
           payload = await handlePlan(args);
           break;
-        case "lola_apply":
+        case "directus_apply":
           payload = await handleApply(args);
           break;
-        case "lola_verify":
+        case "directus_verify":
           payload = await handleVerify(args);
           break;
         default:
@@ -234,6 +234,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  process.stderr.write(`lola-deploy MCP: fatal ${(e as Error).message}\n`);
+  process.stderr.write(`directus-deploy MCP: fatal ${(e as Error).message}\n`);
   process.exit(1);
 });

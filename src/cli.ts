@@ -129,7 +129,7 @@ async function execute(mode: ExecuteOptions, flags: CommonFlags): Promise<number
 
 const program = new Command();
 program
-  .name("lola-deploy")
+  .name("directus-deploy")
   .description(
     "Reconcile a Directus environment to the state described in directus_config/snapshot/. Per-entity, non-atomic.",
   )
@@ -195,6 +195,6 @@ attachCommon(program.command("verify"))
   });
 
 program.parseAsync(process.argv).catch((e) => {
-  process.stderr.write(`lola-deploy: ${(e as Error).message}\n`);
+  process.stderr.write(`directus-deploy: ${(e as Error).message}\n`);
   process.exit(2);
 });

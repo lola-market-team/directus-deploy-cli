@@ -14,7 +14,7 @@ import type { ApplyOptions, DirectusClient, EntityResult } from "../types.js";
 //
 // Idempotent: re-running after a fully-registered table is a no-op.
 //
-// Port of scripts/register-table.mjs from lola-market-backend. Uses
+// Adopts raw-SQL tables into Directus. Uses
 // /raw-query/execute (same as migrations reconciler). Skips cleanly if the
 // raw-query endpoint isn't installed on the target.
 

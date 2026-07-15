@@ -1,11 +1,20 @@
 {
-  "name": "@lola/deploy",
+  "name": "directus-deploy-cli",
   "version": "0.1.0",
-  "description": "First-class Directus deployment tool. Reconciles code + config to any env, per-entity, non-atomic.",
+  "description": "Per-entity, non-atomic Directus deployment tool. Reconciles collections/fields/relations/roles/policies/permissions/flows/operations/migrations/seeds from git to any environment.",
   "type": "module",
   "bin": {
-    "lola-deploy": "dist/cli.js",
-    "lola-deploy-mcp": "dist/mcp-server.js"
+    "directus-deploy": "dist/cli.js",
+    "directus-deploy-mcp": "dist/mcp-server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lola-market-team/directus-deploy-cli.git"
+  },
+  "license": "MIT",
+  "keywords": ["directus", "deploy", "reconcile", "sync", "cli"],
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsc",
