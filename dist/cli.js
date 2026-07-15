@@ -53,10 +53,10 @@ function readCommon(flags) {
         json: Boolean(flags.json),
     };
 }
-async function execute(dryRun, flags) {
+async function execute(mode, flags) {
     const common = readCommon(flags);
     const client = createDirectusClient({ baseUrl: common.url, token: common.token });
-    const opts = { dryRun, onlyCollections: common.onlyCollections };
+    const opts = { dryRun: mode.dryRun, onlyCollections: common.onlyCollections };
     const report = await run({
         target: common.target,
         paths: {
@@ -75,7 +75,18 @@ async function execute(dryRun, flags) {
     else {
         process.stdout.write(formatHuman(report) + "\n");
     }
-    return report.counts.failed > 0 ? 1 : 0;
+    if (report.counts.failed > 0)
+        return 1;
+    if (mode.strict) {
+        // Verify: any drift (created/updated) means the target didn't match git.
+        // `skipped` is intentional (adopted-but-unregistered raw-SQL columns,
+        // register-manifest collections) — never treated as drift.
+        if (report.counts.created > 0 || report.counts.updated > 0) {
+            process.stderr.write(`verify: drift detected (${report.counts.created} would-create, ${report.counts.updated} would-update)\n`);
+            return 1;
+        }
+    }
+    return 0;
 }
 const program = new Command();
 program
@@ -98,12 +109,17 @@ function attachCommon(cmd) {
 attachCommon(program.command("plan"))
     .description("Dry-run: report what would change without writing.")
     .action(async (_, cmd) => {
-    process.exit(await execute(true, cmd.optsWithGlobals()));
+    process.exit(await execute({ dryRun: true }, cmd.optsWithGlobals()));
 });
 attachCommon(program.command("apply"))
     .description("Apply the desired state to the target env.")
     .action(async (_, cmd) => {
-    process.exit(await execute(false, cmd.optsWithGlobals()));
+    process.exit(await execute({ dryRun: false }, cmd.optsWithGlobals()));
+});
+attachCommon(program.command("verify"))
+    .description("Post-apply drift check. Runs plan-mode and exits non-zero if any entity would be created or updated (idempotency guard for CI).")
+    .action(async (_, cmd) => {
+    process.exit(await execute({ dryRun: true, strict: true }, cmd.optsWithGlobals()));
 });
 program.parseAsync(process.argv).catch((e) => {
     process.stderr.write(`lola-deploy: ${e.message}\n`);
