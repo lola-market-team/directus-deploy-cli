@@ -13,6 +13,7 @@
     "test:live": "vitest run --config vitest.live.config.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
+    "prepare": "tsc",
     "prepublishOnly": "npm run build"
   },
   "engines": {
