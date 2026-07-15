@@ -4,7 +4,8 @@
   "description": "First-class Directus deployment tool. Reconciles code + config to any env, per-entity, non-atomic.",
   "type": "module",
   "bin": {
-    "lola-deploy": "dist/cli.js"
+    "lola-deploy": "dist/cli.js",
+    "lola-deploy-mcp": "dist/mcp-server.js"
   },
   "scripts": {
     "build": "tsc",
@@ -19,6 +20,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "commander": "^12.1.0"
   },
   "devDependencies": {
