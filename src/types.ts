@@ -6,7 +6,8 @@ export type EntityKind =
   | "roles"
   | "permissions"
   | "flows"
-  | "operations";
+  | "operations"
+  | "migrations";
 
 export interface EntityResult {
   kind: EntityKind;

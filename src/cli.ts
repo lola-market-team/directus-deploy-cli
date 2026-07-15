@@ -14,6 +14,7 @@ const KNOWN_ENTITIES = [
   "permissions",
   "flows",
   "operations",
+  "migrations",
 ] as const;
 type Entity = (typeof KNOWN_ENTITIES)[number];
 
@@ -26,6 +27,7 @@ interface CommonFlags {
   snapshotDir: string;
   configDir: string;
   registerDir: string;
+  migrationsDir: string;
   json?: boolean;
 }
 
@@ -53,6 +55,7 @@ function readCommon(flags: CommonFlags): {
   snapshotDir: string;
   configDir: string;
   registerDir: string;
+  migrationsDir: string;
   json: boolean;
 } {
   const url = flags.url ?? process.env.DIRECTUS_URL;
@@ -73,6 +76,7 @@ function readCommon(flags: CommonFlags): {
     snapshotDir: flags.snapshotDir,
     configDir: flags.configDir,
     registerDir: flags.registerDir,
+    migrationsDir: flags.migrationsDir,
     json: Boolean(flags.json),
   };
 }
@@ -88,6 +92,7 @@ async function execute(dryRun: boolean, flags: CommonFlags): Promise<number> {
       configDir: common.configDir,
       registerDir: common.registerDir,
     },
+    migrationsDir: common.migrationsDir,
     client,
     opts,
     entities: common.entities,
@@ -133,6 +138,11 @@ function attachCommon(cmd: Command): Command {
       "--register-dir <path>",
       "path to migrations/register",
       "./migrations/register",
+    )
+    .option(
+      "--migrations-dir <path>",
+      "path to migrations/*.sql (raw SQL, tracked in lola_deploy_migrations)",
+      "./migrations",
     )
     .option("--json", "emit JSON report instead of human-readable");
 }
