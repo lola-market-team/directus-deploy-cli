@@ -4,7 +4,9 @@ export type EntityKind =
   | "relations"
   | "policies"
   | "roles"
-  | "permissions";
+  | "permissions"
+  | "flows"
+  | "operations";
 
 export interface EntityResult {
   kind: EntityKind;

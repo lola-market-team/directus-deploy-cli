@@ -14,6 +14,8 @@ export interface Snapshot {
   policies: Record<string, unknown>[];
   roles: Record<string, unknown>[];
   permissions: Record<string, unknown>[];
+  flows: Record<string, unknown>[];
+  operations: Record<string, unknown>[];
   // Raw-SQL adoption
   registerManifests: Set<string>;
 }
@@ -93,6 +95,8 @@ export async function loadSnapshot(paths: SnapshotPaths): Promise<Snapshot> {
     policies: await readJsonArray(join(paths.configDir, "policies.json")),
     roles: await readJsonArray(join(paths.configDir, "roles.json")),
     permissions: await readJsonArray(join(paths.configDir, "permissions.json")),
+    flows: await readJsonArray(join(paths.configDir, "flows.json")),
+    operations: await readJsonArray(join(paths.configDir, "operations.json")),
     registerManifests: await readRegisterManifests(paths.registerDir),
   };
 }

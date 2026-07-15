@@ -12,6 +12,8 @@ const KNOWN_ENTITIES = [
   "roles",
   "policies",
   "permissions",
+  "flows",
+  "operations",
 ] as const;
 type Entity = (typeof KNOWN_ENTITIES)[number];
 
