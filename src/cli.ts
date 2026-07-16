@@ -174,7 +174,7 @@ program
   .description(
     "Reconcile a Directus environment to the state described in directus_config/snapshot/. Per-entity, non-atomic.",
   )
-  .version("0.5.0");
+  .version("0.6.0");
 
 function attachCommon(cmd: Command): Command {
   return cmd
@@ -334,6 +334,66 @@ migrationsGroup
       }
     }
     process.exit(violations.length === 0 ? 0 : 1);
+  });
+
+// Snapshot commands — repo-side static checks that don't hit the network.
+// Ports of scripts/lint-snapshot-refs.py (etc.) into the tool so agents and
+// pre-push hooks call one binary.
+const snapshotGroup = program
+  .command("snapshot")
+  .description("Snapshot repo-side commands (static checks, pull, dump)");
+
+snapshotGroup
+  .command("lint")
+  .description(
+    "Static integrity checks on directus_config/snapshot: dangling meta.group refs, bad field FKs, missing fields dirs, register-manifest pairing, migration comment semicolons.",
+  )
+  .option(
+    "--snapshot-dir <path>",
+    "path to directus_config/snapshot",
+    "./directus_config/snapshot",
+  )
+  .option(
+    "--migrations-dir <path>",
+    "path to migrations",
+    "./migrations",
+  )
+  .option(
+    "--register-dir <path>",
+    "path to migrations/register",
+    "./migrations/register",
+  )
+  .option("--repo-root <path>", "repo root for tidy path printing", process.cwd())
+  .option("--json", "emit JSON output")
+  .action(async (opts: {
+    snapshotDir: string;
+    migrationsDir: string;
+    registerDir: string;
+    repoRoot: string;
+    json?: boolean;
+  }) => {
+    const { lintSnapshot } = await import("./snapshot-lint.js");
+    const report = await lintSnapshot({
+      snapshotDir: opts.snapshotDir,
+      migrationsDir: opts.migrationsDir,
+      registerDir: opts.registerDir,
+      repoRoot: opts.repoRoot,
+    });
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+    } else if (report.offenders.length === 0) {
+      process.stdout.write(
+        `snapshot lint OK — ${report.collectionsScanned} collections + migrations scanned.\n`,
+      );
+    } else {
+      process.stderr.write(
+        `snapshot lint: ${report.offenders.length} issue(s) across ${report.collectionsScanned} collections:\n`,
+      );
+      for (const o of report.offenders) {
+        process.stderr.write(`  ${o.file}: ${o.message}\n`);
+      }
+    }
+    process.exit(report.offenders.length === 0 ? 0 : 1);
   });
 
 const extensionsGroup = program
