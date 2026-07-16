@@ -42,6 +42,19 @@ async function detectDrift(snapshotDir) {
     }
     return drift.sort();
 }
+// Deterministic JSON serialization: keys sorted alphabetically at every
+// depth. Without this, on-disk order tracks whatever the Directus API
+// happens to return, which creates huge cosmetic diffs when comparing
+// files pulled at different times or by different tools.
+function sortKeysDeep(v) {
+    if (Array.isArray(v))
+        return v.map(sortKeysDeep);
+    if (v && typeof v === "object") {
+        const src = v;
+        return Object.fromEntries(Object.keys(src).sort().map((k) => [k, sortKeysDeep(src[k])]));
+    }
+    return v;
+}
 async function writeJsonFile(path, data) {
     const parent = path.slice(0, path.lastIndexOf("/"));
     await mkdir(parent, { recursive: true });
@@ -54,7 +67,16 @@ async function writeJsonFile(path, data) {
         delete m.id;
         copy.meta = m;
     }
-    await writeFile(path, JSON.stringify(copy, null, 2) + "\n", "utf8");
+    // Strip null-valued keys inside `schema` — Directus API adds new
+    // optional keys over versions (e.g. `comment`, `foreign_key_schema`),
+    // all reported as `null` when unused. Omitting means the same thing on
+    // read and keeps files stable across Directus versions.
+    const schema = copy.schema;
+    if (schema && typeof schema === "object") {
+        copy.schema = Object.fromEntries(Object.entries(schema).filter(([, v]) => v !== null));
+    }
+    const sorted = sortKeysDeep(copy);
+    await writeFile(path, JSON.stringify(sorted, null, 2) + "\n", "utf8");
 }
 function getStatus(e) {
     if (e && typeof e === "object" && "status" in e) {
