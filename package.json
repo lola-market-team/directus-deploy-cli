@@ -1,6 +1,6 @@
 {
   "name": "directus-deploy-cli",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Per-entity, non-atomic Directus deployment tool. Reconciles collections/fields/relations/roles/policies/permissions/flows/operations/migrations/seeds from git to any environment.",
   "type": "module",
   "bin": {
@@ -12,7 +12,13 @@
     "url": "git+https://github.com/lola-market-team/directus-deploy-cli.git"
   },
   "license": "MIT",
-  "keywords": ["directus", "deploy", "reconcile", "sync", "cli"],
+  "keywords": [
+    "directus",
+    "deploy",
+    "reconcile",
+    "sync",
+    "cli"
+  ],
   "publishConfig": {
     "access": "public"
   },
