@@ -16,14 +16,22 @@ export interface IdentityIndex {
   roleSyncIdToName: Map<string, string>;
   serverPolicyIdByName: Map<string, string>;
   serverRoleIdByName: Map<string, string>;
+  // UUID-first identity: when the local _syncId equals the server id (the
+  // Tractr-layout common case), we short-circuit the name lookup. This makes
+  // name collisions (two policies both called "Codegen Web") non-fatal — each
+  // resolves to its own server row.
+  serverPolicyIds: Set<string>;
+  serverRoleIds: Set<string>;
   // Flows + operations. Operations don't have a name — their identity within
   // a flow is the `key` field, and their identity across flows is
   // (flow_name, key). We index server ops by (flow_id, key) since a client
   // GET returns `flow` as the server flow id.
   flowSyncIdToName: Map<string, string>;
   serverFlowIdByName: Map<string, string>;
+  serverFlowIds: Set<string>;
   opSyncIdToFlowAndKey: Map<string, { flowSyncId: string; key: string }>;
   serverOpIdByFlowIdAndKey: Map<string, string>; // key format: `${flowId}::${opKey}`
+  serverOpIds: Set<string>;
 }
 
 function collectNames(
@@ -66,6 +74,15 @@ function indexByName(
     if (name && id) map.set(name, id);
   }
   return map;
+}
+
+function collectIds(rows: Record<string, unknown>[]): Set<string> {
+  const set = new Set<string>();
+  for (const r of rows) {
+    const id = String((r as { id?: unknown }).id ?? "");
+    if (id) set.add(id);
+  }
+  return set;
 }
 
 function collectOpSyncIdIndex(
@@ -120,17 +137,26 @@ export async function buildIdentity(
     roleSyncIdToName: collectNames(localRoles),
     serverPolicyIdByName: indexByName(serverPolicies),
     serverRoleIdByName: indexByName(serverRoles),
+    serverPolicyIds: collectIds(serverPolicies),
+    serverRoleIds: collectIds(serverRoles),
     flowSyncIdToName: collectNames(localFlows),
     serverFlowIdByName: indexByName(serverFlows),
+    serverFlowIds: collectIds(serverFlows),
     opSyncIdToFlowAndKey: collectOpSyncIdIndex(localOps),
     serverOpIdByFlowIdAndKey: indexServerOps(serverOps),
+    serverOpIds: collectIds(serverOps),
   };
 }
 
+// Prefer UUID match (works when local _syncId == server id, which is the
+// Tractr-layout common case AND is robust to name collisions). Fall back to
+// name lookup for envs where the tool has to create rows fresh under a
+// different UUID.
 export function resolvePolicySyncIdToServerId(
   syncId: string,
   idx: IdentityIndex,
 ): string | null {
+  if (idx.serverPolicyIds.has(syncId)) return syncId;
   const name = idx.policySyncIdToName.get(syncId);
   if (!name) return null;
   return idx.serverPolicyIdByName.get(name) ?? null;
@@ -140,6 +166,7 @@ export function resolveRoleSyncIdToServerId(
   syncId: string,
   idx: IdentityIndex,
 ): string | null {
+  if (idx.serverRoleIds.has(syncId)) return syncId;
   const name = idx.roleSyncIdToName.get(syncId);
   if (!name) return null;
   return idx.serverRoleIdByName.get(name) ?? null;
@@ -149,6 +176,7 @@ export function resolveFlowSyncIdToServerId(
   syncId: string,
   idx: IdentityIndex,
 ): string | null {
+  if (idx.serverFlowIds.has(syncId)) return syncId;
   const name = idx.flowSyncIdToName.get(syncId);
   if (!name) return null;
   return idx.serverFlowIdByName.get(name) ?? null;

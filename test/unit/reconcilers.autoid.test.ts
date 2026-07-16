@@ -59,6 +59,14 @@ function fakeIdentity(): IdentityIndex {
     roleSyncIdToName: new Map([["sync-r", "RoleA"]]),
     serverPolicyIdByName: new Map([["PolicyA", "server-policy-A"]]),
     serverRoleIdByName: new Map([["RoleA", "server-role-A"]]),
+    serverPolicyIds: new Set(),
+    serverRoleIds: new Set(),
+    flowSyncIdToName: new Map(),
+    serverFlowIdByName: new Map(),
+    serverFlowIds: new Set(),
+    opSyncIdToFlowAndKey: new Map(),
+    serverOpIdByFlowIdAndKey: new Map(),
+    serverOpIds: new Set(),
   };
 }
 
