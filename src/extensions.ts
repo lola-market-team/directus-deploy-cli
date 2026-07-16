@@ -289,32 +289,46 @@ export async function statusExtensions(input: StatusInput): Promise<ExtensionSta
 }
 
 // -------------------- extensions diff --------------------
-// Cross-env, cross-reference status matrix. One HTTP call per (target, ext)
-// pair + one `git branch --contains` per unique commit SHA. Output tells you,
-// in one call:
-//   - which SHA is live per env
-//   - whether that SHA is reachable from a reference branch (e.g. origin/master)
-//   - which branches contain each SHA (surfaces "WIP on feat/*" vs "on master")
+// Cross-env content-equivalence matrix. Compares the git *tree hash* of
+// extensions/<name>/ at the deployed sourceCommit against the same path at
+// the reference ref. Tree hash is git's own content-addressable identifier —
+// same source tree = same tree hash, regardless of commit lineage. This
+// sidesteps every branch/squash/history-rewrite pathology that the old
+// SHA-ancestry check had:
+//
+//   - squash-merge orphans a branch's SHA; ancestry check reports "not on
+//     ref" even though the SOURCE is byte-identical. Tree hash matches.
+//   - "unpushed?" (SHA not on any remote branch) used to be indistinguishable
+//     from "code lost." Tree hash resolves it: if the local objects exist,
+//     we know whether the source matches ref regardless of push state.
+//   - Default reference was origin/master; in a develop-first release train
+//     everything integrated but not yet released showed as ✗. Default is now
+//     origin/develop; --reference overrides.
+//
+// One HTTP call per (target, ext), one `git rev-parse <sha>:<path>` per
+// unique (sha, ext) pair, one for reference. All local.
 
 export interface DiffInput {
   targetsFile: string;
   extensions?: string[];  // if provided, only these
   targets?: string[];     // if provided, only these targets (default: every target in the file)
   repoRoot: string;
-  reference: string;      // branch ref to check against, e.g. "origin/master"
+  reference: string;      // ref to compare content against, e.g. "origin/develop"
 }
 
 export interface DiffCell {
   target: string;
   sourceCommit: string | null;
-  onReference: boolean;         // is sourceCommit reachable from `reference`?
-  containingBranches: string[]; // all remote branches that contain sourceCommit
+  deployedTreeHash: string | null; // git tree hash of extensions/<name>/ at sourceCommit
+  matchesReference: boolean;       // deployedTreeHash === referenceTreeHash for this ext
+  branchHint: string | null;       // best-effort branch label when content differs (single branch if unambiguous)
   error?: string;
 }
 
 export interface DiffRow {
   extension: string;
-  cells: Record<string, DiffCell>; // target → cell
+  referenceTreeHash: string | null; // git tree hash of extensions/<name>/ at reference
+  cells: Record<string, DiffCell>;  // target → cell
 }
 
 export interface DiffReport {
@@ -323,18 +337,48 @@ export interface DiffReport {
   rows: DiffRow[];
 }
 
-async function gitBranchesContaining(repoRoot: string, sha: string): Promise<string[]> {
-  const r = await runCommand("git", ["-C", repoRoot, "branch", "-r", "--contains", sha]);
-  if (r.code !== 0) return [];
-  return r.stdout
-    .split("\n")
-    .map((s) => s.replace(/^\*?\s+/, "").trim())
-    .filter((s) => s.length > 0 && !s.startsWith("origin/HEAD"));
+// Returns the git tree hash of a path at a given ref (`git rev-parse <ref>:<path>`).
+// Empty string if the object is missing (SHA not fetched, path doesn't exist).
+async function gitTreeHash(repoRoot: string, ref: string, path: string): Promise<string | null> {
+  // Trailing slash matters — git resolves `<ref>:extensions/foo/` to the tree,
+  // `<ref>:extensions/foo` to the same tree, but only when it exists. Normalize.
+  const target = `${ref}:${path.replace(/\/+$/, "")}`;
+  const r = await runCommand("git", ["-C", repoRoot, "rev-parse", target]);
+  if (r.code !== 0) return null;
+  const line = r.stdout.trim().split("\n")[0]?.trim();
+  return line && /^[0-9a-f]{40}$/.test(line) ? line : null;
 }
 
-async function gitReferenceContains(repoRoot: string, reference: string, sha: string): Promise<boolean> {
-  const r = await runCommand("git", ["-C", repoRoot, "merge-base", "--is-ancestor", sha, reference]);
-  return r.code === 0;
+// When content differs, we still want a hint about what's running. Prefer
+// a branch that has EXACTLY the same tree hash for this ext — that identifies
+// the WIP branch directly, without listing every branch that happens to
+// contain the SHA in its history. Falls back to null when nothing matches.
+async function branchHintForTreeHash(
+  repoRoot: string,
+  ext: string,
+  treeHash: string,
+  reference: string,
+): Promise<string | null> {
+  // List all remote branches; short-circuit on empty.
+  const r = await runCommand("git", ["-C", repoRoot, "for-each-ref", "--format=%(refname)", "refs/remotes/"]);
+  if (r.code !== 0) return null;
+  const branches = r.stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && !s.endsWith("/HEAD") && s !== `refs/remotes/${reference.replace(/^origin\//, "origin/")}`);
+
+  const path = `extensions/${ext}`;
+  const matches: string[] = [];
+  for (const ref of branches) {
+    const h = await gitTreeHash(repoRoot, ref, path);
+    if (h === treeHash) matches.push(ref.replace(/^refs\/remotes\//, ""));
+  }
+  if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0]!;
+  // Multiple branches share this tree — pick the shortest name (usually the
+  // canonical one, e.g. feat/foo over user/copy-of-feat/foo).
+  matches.sort((a, b) => a.length - b.length);
+  return `${matches[0]} (+${matches.length - 1} more)`;
 }
 
 export async function diffExtensions(input: DiffInput): Promise<DiffReport> {
@@ -348,13 +392,21 @@ export async function diffExtensions(input: DiffInput): Promise<DiffReport> {
     ? input.extensions
     : await listExtensions(input.repoRoot);
 
-  // Cache branch-contains + ancestor lookups per SHA (multiple targets may share a SHA).
-  const containsCache = new Map<string, string[]>();
-  const ancestorCache = new Map<string, boolean>();
+  // Tree-hash cache — one lookup per (sha, ext) pair, reused across targets.
+  const treeHashCache = new Map<string, string | null>();
+  const cachedTreeHash = async (ref: string, ext: string): Promise<string | null> => {
+    const key = `${ref}::extensions/${ext}`;
+    if (treeHashCache.has(key)) return treeHashCache.get(key)!;
+    const h = await gitTreeHash(input.repoRoot, ref, `extensions/${ext}`);
+    treeHashCache.set(key, h);
+    return h;
+  };
 
   const rows: DiffRow[] = [];
   for (const ext of names) {
-    const row: DiffRow = { extension: ext, cells: {} };
+    const referenceTreeHash = await cachedTreeHash(input.reference, ext);
+    const row: DiffRow = { extension: ext, referenceTreeHash, cells: {} };
+
     for (const targetName of targetNames) {
       const target = cfg.targets[targetName]!;
       const url = `${target.base_url.replace(/\/+$/, "")}/${ext}/_meta`;
@@ -372,23 +424,28 @@ export async function diffExtensions(input: DiffInput): Promise<DiffReport> {
         error = (e as Error).message;
       }
 
-      let containingBranches: string[] = [];
-      let onReference = false;
+      let deployedTreeHash: string | null = null;
+      let matchesReference = false;
+      let branchHint: string | null = null;
+
       if (sourceCommit) {
-        if (containsCache.has(sourceCommit)) {
-          containingBranches = containsCache.get(sourceCommit)!;
-        } else {
-          containingBranches = await gitBranchesContaining(input.repoRoot, sourceCommit);
-          containsCache.set(sourceCommit, containingBranches);
+        deployedTreeHash = await cachedTreeHash(sourceCommit, ext);
+        if (deployedTreeHash && referenceTreeHash) {
+          matchesReference = deployedTreeHash === referenceTreeHash;
         }
-        if (ancestorCache.has(sourceCommit)) {
-          onReference = ancestorCache.get(sourceCommit)!;
-        } else {
-          onReference = await gitReferenceContains(input.repoRoot, input.reference, sourceCommit);
-          ancestorCache.set(sourceCommit, onReference);
+        if (deployedTreeHash && !matchesReference) {
+          branchHint = await branchHintForTreeHash(input.repoRoot, ext, deployedTreeHash, input.reference);
         }
       }
-      row.cells[targetName] = { target: targetName, sourceCommit, onReference, containingBranches, error };
+
+      row.cells[targetName] = {
+        target: targetName,
+        sourceCommit,
+        deployedTreeHash,
+        matchesReference,
+        branchHint,
+        error,
+      };
     }
     rows.push(row);
   }
@@ -417,7 +474,8 @@ export function renderDiff(report: DiffReport): string {
       if (!cell) return "?               ".padEnd(cellCol);
       if (cell.error) return `err: ${cell.error}`.padEnd(cellCol);
       if (!cell.sourceCommit) return "not deployed".padEnd(cellCol);
-      const marker = cell.onReference ? "✓" : "✗";
+      // ✓ = source tree matches reference, ✗ = differs, ? = SHA not local (can't verify)
+      const marker = cell.deployedTreeHash == null ? "?" : cell.matchesReference ? "✓" : "✗";
       return `${shortSha(cell.sourceCommit)} ${marker}`.padEnd(cellCol);
     });
 
@@ -426,17 +484,20 @@ export function renderDiff(report: DiffReport): string {
     let state: string;
     if (deployedCells.length === 0) {
       state = "not deployed anywhere";
-    } else if (deployedCells.every((c) => c!.onReference)) {
-      state = `on ${report.reference}`;
+    } else if (deployedCells.every((c) => c!.matchesReference)) {
+      state = `matches ${report.reference}`;
+    } else if (deployedCells.some((c) => c!.deployedTreeHash == null)) {
+      // Fetch first, then compare — some SHAs aren't local yet.
+      const missing = deployedCells.filter((c) => c!.deployedTreeHash == null).length;
+      state = `${missing} deployed SHA(s) not in local git — try 'git fetch --all'`;
     } else {
-      // Which targets are off-reference? Note the branches.
+      // Which targets differ from reference? Note the branch hint per target.
       const off = report.targets
         .map((t) => ({ t, c: row.cells[t] }))
-        .filter(({ c }) => c?.sourceCommit && !c.onReference);
+        .filter(({ c }) => c?.sourceCommit && !c.matchesReference && c.deployedTreeHash != null);
       const detail = off.map(({ t, c }) => {
-        const brs = (c!.containingBranches || []).filter((b) => b !== report.reference);
-        const brief = brs.length === 1 ? brs[0] : brs.length ? `${brs.length} branches` : "unpushed?";
-        return `${t}=${brief}`;
+        const hint = c!.branchHint ?? "orphaned (post-squash?)";
+        return `${t}=${hint}`;
       });
       state = detail.join(" ");
     }
@@ -447,6 +508,8 @@ export function renderDiff(report: DiffReport): string {
   }
 
   lines.push("");
-  lines.push(`legend: ✓ = reachable from ${report.reference}   ✗ = not on ${report.reference}`);
+  lines.push(
+    `legend: ✓ = source tree matches ${report.reference}   ✗ = differs   ? = deployed SHA not in local git`,
+  );
   return lines.join("\n");
 }

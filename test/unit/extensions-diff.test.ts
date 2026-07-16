@@ -17,25 +17,29 @@ async function scratchRepo(files: Record<string, string>): Promise<string> {
 }
 
 describe("renderDiff", () => {
-  it("renders clean state when every cell is on the reference", () => {
+  it("renders clean state when every cell's tree hash matches the reference", () => {
+    const treeHash = "a".repeat(40);
     const report: DiffReport = {
-      reference: "origin/master",
+      reference: "origin/develop",
       targets: ["test", "staging"],
       rows: [
         {
           extension: "chat",
+          referenceTreeHash: treeHash,
           cells: {
             test: {
               target: "test",
               sourceCommit: "ad45074eabcdef",
-              onReference: true,
-              containingBranches: ["origin/master"],
+              deployedTreeHash: treeHash,
+              matchesReference: true,
+              branchHint: null,
             },
             staging: {
               target: "staging",
               sourceCommit: "ad45074eabcdef",
-              onReference: true,
-              containingBranches: ["origin/master"],
+              deployedTreeHash: treeHash,
+              matchesReference: true,
+              branchHint: null,
             },
           },
         },
@@ -44,28 +48,33 @@ describe("renderDiff", () => {
     const out = renderDiff(report);
     expect(out).toMatch(/chat/);
     expect(out).toMatch(/ad45074e ✓/);
-    expect(out).toMatch(/on origin\/master/);
+    expect(out).toMatch(/matches origin\/develop/);
   });
 
-  it("surfaces WIP branch drift per target", () => {
+  it("surfaces WIP branch drift with a branch hint per target", () => {
+    const refTree = "b".repeat(40);
+    const wipTree = "c".repeat(40);
     const report: DiffReport = {
-      reference: "origin/master",
+      reference: "origin/develop",
       targets: ["test", "staging"],
       rows: [
         {
           extension: "search",
+          referenceTreeHash: refTree,
           cells: {
             test: {
               target: "test",
               sourceCommit: "784910f4wip",
-              onReference: false,
-              containingBranches: ["origin/feat/listing-group-visibility"],
+              deployedTreeHash: wipTree,
+              matchesReference: false,
+              branchHint: "origin/feat/listing-group-visibility",
             },
             staging: {
               target: "staging",
               sourceCommit: "a0fbd027merged",
-              onReference: true,
-              containingBranches: ["origin/master"],
+              deployedTreeHash: refTree,
+              matchesReference: true,
+              branchHint: null,
             },
           },
         },
@@ -78,19 +87,79 @@ describe("renderDiff", () => {
     expect(out).toMatch(/test=origin\/feat\/listing/);
   });
 
+  it("flags a deployed SHA that isn't in local git objects", () => {
+    const report: DiffReport = {
+      reference: "origin/develop",
+      targets: ["test", "staging"],
+      rows: [
+        {
+          extension: "search",
+          referenceTreeHash: "d".repeat(40),
+          cells: {
+            test: {
+              target: "test",
+              sourceCommit: "784910f4wip",
+              deployedTreeHash: null,          // SHA not fetched locally
+              matchesReference: false,
+              branchHint: null,
+            },
+            staging: {
+              target: "staging",
+              sourceCommit: "a0fbd027merged",
+              deployedTreeHash: null,
+              matchesReference: false,
+              branchHint: null,
+            },
+          },
+        },
+      ],
+    };
+    const out = renderDiff(report);
+    expect(out).toMatch(/784910f4 \?/);
+    expect(out).toMatch(/not in local git/);
+  });
+
+  it("labels a source tree that's diverged from every known branch as orphaned", () => {
+    const refTree = "e".repeat(40);
+    const orphanTree = "f".repeat(40);
+    const report: DiffReport = {
+      reference: "origin/develop",
+      targets: ["test"],
+      rows: [
+        {
+          extension: "rental-reviews",
+          referenceTreeHash: refTree,
+          cells: {
+            test: {
+              target: "test",
+              sourceCommit: "340e68d9orphan",
+              deployedTreeHash: orphanTree,
+              matchesReference: false,
+              branchHint: null,  // no branch has this exact tree
+            },
+          },
+        },
+      ],
+    };
+    const out = renderDiff(report);
+    expect(out).toMatch(/test=orphaned/);
+  });
+
   it("labels an extension that isn't deployed anywhere", () => {
     const report: DiffReport = {
-      reference: "origin/master",
+      reference: "origin/develop",
       targets: ["test"],
       rows: [
         {
           extension: "unshipped",
+          referenceTreeHash: "1".repeat(40),
           cells: {
             test: {
               target: "test",
               sourceCommit: null,
-              onReference: false,
-              containingBranches: [],
+              deployedTreeHash: null,
+              matchesReference: false,
+              branchHint: null,
               error: "HTTP 404",
             },
           },

@@ -191,18 +191,46 @@ export async function statusExtensions(input) {
     }
     return out;
 }
-async function gitBranchesContaining(repoRoot, sha) {
-    const r = await runCommand("git", ["-C", repoRoot, "branch", "-r", "--contains", sha]);
+// Returns the git tree hash of a path at a given ref (`git rev-parse <ref>:<path>`).
+// Empty string if the object is missing (SHA not fetched, path doesn't exist).
+async function gitTreeHash(repoRoot, ref, path) {
+    // Trailing slash matters — git resolves `<ref>:extensions/foo/` to the tree,
+    // `<ref>:extensions/foo` to the same tree, but only when it exists. Normalize.
+    const target = `${ref}:${path.replace(/\/+$/, "")}`;
+    const r = await runCommand("git", ["-C", repoRoot, "rev-parse", target]);
     if (r.code !== 0)
-        return [];
-    return r.stdout
-        .split("\n")
-        .map((s) => s.replace(/^\*?\s+/, "").trim())
-        .filter((s) => s.length > 0 && !s.startsWith("origin/HEAD"));
+        return null;
+    const line = r.stdout.trim().split("\n")[0]?.trim();
+    return line && /^[0-9a-f]{40}$/.test(line) ? line : null;
 }
-async function gitReferenceContains(repoRoot, reference, sha) {
-    const r = await runCommand("git", ["-C", repoRoot, "merge-base", "--is-ancestor", sha, reference]);
-    return r.code === 0;
+// When content differs, we still want a hint about what's running. Prefer
+// a branch that has EXACTLY the same tree hash for this ext — that identifies
+// the WIP branch directly, without listing every branch that happens to
+// contain the SHA in its history. Falls back to null when nothing matches.
+async function branchHintForTreeHash(repoRoot, ext, treeHash, reference) {
+    // List all remote branches; short-circuit on empty.
+    const r = await runCommand("git", ["-C", repoRoot, "for-each-ref", "--format=%(refname)", "refs/remotes/"]);
+    if (r.code !== 0)
+        return null;
+    const branches = r.stdout
+        .split("\n")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0 && !s.endsWith("/HEAD") && s !== `refs/remotes/${reference.replace(/^origin\//, "origin/")}`);
+    const path = `extensions/${ext}`;
+    const matches = [];
+    for (const ref of branches) {
+        const h = await gitTreeHash(repoRoot, ref, path);
+        if (h === treeHash)
+            matches.push(ref.replace(/^refs\/remotes\//, ""));
+    }
+    if (matches.length === 0)
+        return null;
+    if (matches.length === 1)
+        return matches[0];
+    // Multiple branches share this tree — pick the shortest name (usually the
+    // canonical one, e.g. feat/foo over user/copy-of-feat/foo).
+    matches.sort((a, b) => a.length - b.length);
+    return `${matches[0]} (+${matches.length - 1} more)`;
 }
 export async function diffExtensions(input) {
     const cfg = await loadTargets(input.targetsFile);
@@ -214,12 +242,20 @@ export async function diffExtensions(input) {
     const names = input.extensions?.length
         ? input.extensions
         : await listExtensions(input.repoRoot);
-    // Cache branch-contains + ancestor lookups per SHA (multiple targets may share a SHA).
-    const containsCache = new Map();
-    const ancestorCache = new Map();
+    // Tree-hash cache — one lookup per (sha, ext) pair, reused across targets.
+    const treeHashCache = new Map();
+    const cachedTreeHash = async (ref, ext) => {
+        const key = `${ref}::extensions/${ext}`;
+        if (treeHashCache.has(key))
+            return treeHashCache.get(key);
+        const h = await gitTreeHash(input.repoRoot, ref, `extensions/${ext}`);
+        treeHashCache.set(key, h);
+        return h;
+    };
     const rows = [];
     for (const ext of names) {
-        const row = { extension: ext, cells: {} };
+        const referenceTreeHash = await cachedTreeHash(input.reference, ext);
+        const row = { extension: ext, referenceTreeHash, cells: {} };
         for (const targetName of targetNames) {
             const target = cfg.targets[targetName];
             const url = `${target.base_url.replace(/\/+$/, "")}/${ext}/_meta`;
@@ -239,25 +275,26 @@ export async function diffExtensions(input) {
             catch (e) {
                 error = e.message;
             }
-            let containingBranches = [];
-            let onReference = false;
+            let deployedTreeHash = null;
+            let matchesReference = false;
+            let branchHint = null;
             if (sourceCommit) {
-                if (containsCache.has(sourceCommit)) {
-                    containingBranches = containsCache.get(sourceCommit);
+                deployedTreeHash = await cachedTreeHash(sourceCommit, ext);
+                if (deployedTreeHash && referenceTreeHash) {
+                    matchesReference = deployedTreeHash === referenceTreeHash;
                 }
-                else {
-                    containingBranches = await gitBranchesContaining(input.repoRoot, sourceCommit);
-                    containsCache.set(sourceCommit, containingBranches);
-                }
-                if (ancestorCache.has(sourceCommit)) {
-                    onReference = ancestorCache.get(sourceCommit);
-                }
-                else {
-                    onReference = await gitReferenceContains(input.repoRoot, input.reference, sourceCommit);
-                    ancestorCache.set(sourceCommit, onReference);
+                if (deployedTreeHash && !matchesReference) {
+                    branchHint = await branchHintForTreeHash(input.repoRoot, ext, deployedTreeHash, input.reference);
                 }
             }
-            row.cells[targetName] = { target: targetName, sourceCommit, onReference, containingBranches, error };
+            row.cells[targetName] = {
+                target: targetName,
+                sourceCommit,
+                deployedTreeHash,
+                matchesReference,
+                branchHint,
+                error,
+            };
         }
         rows.push(row);
     }
@@ -284,7 +321,8 @@ export function renderDiff(report) {
                 return `err: ${cell.error}`.padEnd(cellCol);
             if (!cell.sourceCommit)
                 return "not deployed".padEnd(cellCol);
-            const marker = cell.onReference ? "✓" : "✗";
+            // ✓ = source tree matches reference, ✗ = differs, ? = SHA not local (can't verify)
+            const marker = cell.deployedTreeHash == null ? "?" : cell.matchesReference ? "✓" : "✗";
             return `${shortSha(cell.sourceCommit)} ${marker}`.padEnd(cellCol);
         });
         // Per-row state: aggregate across cells.
@@ -293,25 +331,29 @@ export function renderDiff(report) {
         if (deployedCells.length === 0) {
             state = "not deployed anywhere";
         }
-        else if (deployedCells.every((c) => c.onReference)) {
-            state = `on ${report.reference}`;
+        else if (deployedCells.every((c) => c.matchesReference)) {
+            state = `matches ${report.reference}`;
+        }
+        else if (deployedCells.some((c) => c.deployedTreeHash == null)) {
+            // Fetch first, then compare — some SHAs aren't local yet.
+            const missing = deployedCells.filter((c) => c.deployedTreeHash == null).length;
+            state = `${missing} deployed SHA(s) not in local git — try 'git fetch --all'`;
         }
         else {
-            // Which targets are off-reference? Note the branches.
+            // Which targets differ from reference? Note the branch hint per target.
             const off = report.targets
                 .map((t) => ({ t, c: row.cells[t] }))
-                .filter(({ c }) => c?.sourceCommit && !c.onReference);
+                .filter(({ c }) => c?.sourceCommit && !c.matchesReference && c.deployedTreeHash != null);
             const detail = off.map(({ t, c }) => {
-                const brs = (c.containingBranches || []).filter((b) => b !== report.reference);
-                const brief = brs.length === 1 ? brs[0] : brs.length ? `${brs.length} branches` : "unpushed?";
-                return `${t}=${brief}`;
+                const hint = c.branchHint ?? "orphaned (post-squash?)";
+                return `${t}=${hint}`;
             });
             state = detail.join(" ");
         }
         lines.push(row.extension.padEnd(nameCol) + "  " + cells.join("") + state);
     }
     lines.push("");
-    lines.push(`legend: ✓ = reachable from ${report.reference}   ✗ = not on ${report.reference}`);
+    lines.push(`legend: ✓ = source tree matches ${report.reference}   ✗ = differs   ? = deployed SHA not in local git`);
     return lines.join("\n");
 }
 //# sourceMappingURL=extensions.js.map

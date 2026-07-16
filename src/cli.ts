@@ -561,12 +561,12 @@ extensionsGroup
 extensionsGroup
   .command("diff")
   .description(
-    "Cross-env deploy matrix: one row per extension, one column per target. Shows deployed sourceCommit + whether it's reachable from a reference branch (default: origin/master). Surfaces WIP-on-test, staging-lag, unmerged branches in one call.",
+    "Cross-env content-equivalence matrix: one row per extension, one column per target. Compares the git tree hash of extensions/<name>/ at the deployed sourceCommit vs the reference ref (default: origin/develop). Immune to squash-merge SHA orphaning and branch history rewrites — same source tree = ✓, different = ✗.",
   )
   .argument("[names...]", "extensions to check (default: all)")
   .option("--targets <csv>", "restrict to these targets (default: every target in the file)")
   .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
-  .option("--reference <ref>", "branch ref to check reachability against", "origin/master")
+  .option("--reference <ref>", "ref to compare deployed source tree against", "origin/develop")
   .option("--repo-root <path>", "repo root (default: cwd)", process.cwd())
   .option("--json", "emit JSON")
   .action(async (names: string[], opts: {
@@ -590,7 +590,7 @@ extensionsGroup
       process.stdout.write(renderDiff(report) + "\n");
     }
     const drift = report.rows.some((r) =>
-      Object.values(r.cells).some((c) => c.sourceCommit && !c.onReference),
+      Object.values(r.cells).some((c) => c.sourceCommit && !c.matchesReference),
     );
     process.exit(drift ? 1 : 0);
   });
