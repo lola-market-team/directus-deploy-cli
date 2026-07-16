@@ -287,3 +287,166 @@ export async function statusExtensions(input: StatusInput): Promise<ExtensionSta
   }
   return out;
 }
+
+// -------------------- extensions diff --------------------
+// Cross-env, cross-reference status matrix. One HTTP call per (target, ext)
+// pair + one `git branch --contains` per unique commit SHA. Output tells you,
+// in one call:
+//   - which SHA is live per env
+//   - whether that SHA is reachable from a reference branch (e.g. origin/master)
+//   - which branches contain each SHA (surfaces "WIP on feat/*" vs "on master")
+
+export interface DiffInput {
+  targetsFile: string;
+  extensions?: string[];  // if provided, only these
+  targets?: string[];     // if provided, only these targets (default: every target in the file)
+  repoRoot: string;
+  reference: string;      // branch ref to check against, e.g. "origin/master"
+}
+
+export interface DiffCell {
+  target: string;
+  sourceCommit: string | null;
+  onReference: boolean;         // is sourceCommit reachable from `reference`?
+  containingBranches: string[]; // all remote branches that contain sourceCommit
+  error?: string;
+}
+
+export interface DiffRow {
+  extension: string;
+  cells: Record<string, DiffCell>; // target → cell
+}
+
+export interface DiffReport {
+  reference: string;
+  targets: string[];
+  rows: DiffRow[];
+}
+
+async function gitBranchesContaining(repoRoot: string, sha: string): Promise<string[]> {
+  const r = await runCommand("git", ["-C", repoRoot, "branch", "-r", "--contains", sha]);
+  if (r.code !== 0) return [];
+  return r.stdout
+    .split("\n")
+    .map((s) => s.replace(/^\*?\s+/, "").trim())
+    .filter((s) => s.length > 0 && !s.startsWith("origin/HEAD"));
+}
+
+async function gitReferenceContains(repoRoot: string, reference: string, sha: string): Promise<boolean> {
+  const r = await runCommand("git", ["-C", repoRoot, "merge-base", "--is-ancestor", sha, reference]);
+  return r.code === 0;
+}
+
+export async function diffExtensions(input: DiffInput): Promise<DiffReport> {
+  const cfg = await loadTargets(input.targetsFile);
+  const targetNames = input.targets?.length ? input.targets : Object.keys(cfg.targets);
+  const missing = targetNames.filter((t) => !cfg.targets[t]);
+  if (missing.length) {
+    throw new Error(`unknown target(s): ${missing.join(", ")}`);
+  }
+  const names = input.extensions?.length
+    ? input.extensions
+    : await listExtensions(input.repoRoot);
+
+  // Cache branch-contains + ancestor lookups per SHA (multiple targets may share a SHA).
+  const containsCache = new Map<string, string[]>();
+  const ancestorCache = new Map<string, boolean>();
+
+  const rows: DiffRow[] = [];
+  for (const ext of names) {
+    const row: DiffRow = { extension: ext, cells: {} };
+    for (const targetName of targetNames) {
+      const target = cfg.targets[targetName]!;
+      const url = `${target.base_url.replace(/\/+$/, "")}/${ext}/_meta`;
+      let sourceCommit: string | null = null;
+      let error: string | undefined;
+      try {
+        const r = await fetch(url);
+        if (r.ok) {
+          const body = (await r.json()) as { sourceCommit?: unknown };
+          if (typeof body?.sourceCommit === "string") sourceCommit = body.sourceCommit;
+        } else {
+          error = `HTTP ${r.status}`;
+        }
+      } catch (e) {
+        error = (e as Error).message;
+      }
+
+      let containingBranches: string[] = [];
+      let onReference = false;
+      if (sourceCommit) {
+        if (containsCache.has(sourceCommit)) {
+          containingBranches = containsCache.get(sourceCommit)!;
+        } else {
+          containingBranches = await gitBranchesContaining(input.repoRoot, sourceCommit);
+          containsCache.set(sourceCommit, containingBranches);
+        }
+        if (ancestorCache.has(sourceCommit)) {
+          onReference = ancestorCache.get(sourceCommit)!;
+        } else {
+          onReference = await gitReferenceContains(input.repoRoot, input.reference, sourceCommit);
+          ancestorCache.set(sourceCommit, onReference);
+        }
+      }
+      row.cells[targetName] = { target: targetName, sourceCommit, onReference, containingBranches, error };
+    }
+    rows.push(row);
+  }
+  return { reference: input.reference, targets: targetNames, rows };
+}
+
+// Human-friendly renderer for a DiffReport. Compact matrix — one row per
+// extension, one column per target, one final "state" summary.
+export function renderDiff(report: DiffReport): string {
+  const nameCol = Math.max(9, ...report.rows.map((r) => r.extension.length));
+  const cellCol = 18;
+
+  const header =
+    "extension".padEnd(nameCol) +
+    "  " +
+    report.targets.map((t) => t.padEnd(cellCol)).join("") +
+    "state";
+  const sep = "─".repeat(header.length);
+  const lines: string[] = [header, sep];
+
+  const shortSha = (s: string | null): string => (s ? s.slice(0, 8) : "—       ");
+
+  for (const row of report.rows) {
+    const cells = report.targets.map((t) => {
+      const cell = row.cells[t];
+      if (!cell) return "?               ".padEnd(cellCol);
+      if (cell.error) return `err: ${cell.error}`.padEnd(cellCol);
+      if (!cell.sourceCommit) return "not deployed".padEnd(cellCol);
+      const marker = cell.onReference ? "✓" : "✗";
+      return `${shortSha(cell.sourceCommit)} ${marker}`.padEnd(cellCol);
+    });
+
+    // Per-row state: aggregate across cells.
+    const deployedCells = report.targets.map((t) => row.cells[t]).filter((c) => c?.sourceCommit);
+    let state: string;
+    if (deployedCells.length === 0) {
+      state = "not deployed anywhere";
+    } else if (deployedCells.every((c) => c!.onReference)) {
+      state = `on ${report.reference}`;
+    } else {
+      // Which targets are off-reference? Note the branches.
+      const off = report.targets
+        .map((t) => ({ t, c: row.cells[t] }))
+        .filter(({ c }) => c?.sourceCommit && !c.onReference);
+      const detail = off.map(({ t, c }) => {
+        const brs = (c!.containingBranches || []).filter((b) => b !== report.reference);
+        const brief = brs.length === 1 ? brs[0] : brs.length ? `${brs.length} branches` : "unpushed?";
+        return `${t}=${brief}`;
+      });
+      state = detail.join(" ");
+    }
+
+    lines.push(
+      row.extension.padEnd(nameCol) + "  " + cells.join("") + state,
+    );
+  }
+
+  lines.push("");
+  lines.push(`legend: ✓ = reachable from ${report.reference}   ✗ = not on ${report.reference}`);
+  return lines.join("\n");
+}
