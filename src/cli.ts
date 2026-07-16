@@ -123,8 +123,49 @@ async function execute(mode: ExecuteOptions, flags: CommonFlags): Promise<number
       );
       return 1;
     }
+    // Server-side gate: any `directus_fields.type = 'unknown'` row on the
+    // target means a raw-SQL column was added but never registered — either
+    // via `migrations/register/<table>.json` or by a Directus-native field
+    // definition. Fail fast so the miss surfaces here, not in a UI 500.
+    const unknowns = await fetchUnknownFields(client);
+    if (unknowns === null) {
+      process.stderr.write(
+        `verify: could not query directus_fields for type=unknown (raw-query endpoint unavailable?) — skipping check\n`,
+      );
+    } else if (unknowns.length > 0) {
+      process.stderr.write(
+        `verify: ${unknowns.length} field(s) have type='unknown' on target — add a register manifest or Directus field definition:\n`,
+      );
+      for (const u of unknowns) {
+        process.stderr.write(`  ${u.collection}.${u.field}\n`);
+      }
+      return 1;
+    }
   }
   return 0;
+}
+
+async function fetchUnknownFields(
+  client: import("./types.js").DirectusClient,
+): Promise<Array<{ collection: string; field: string }> | null> {
+  try {
+    const r = (await client.postRaw("/raw-query/execute", {
+      query:
+        "SELECT collection, field FROM directus_fields WHERE type = 'unknown' ORDER BY collection, field",
+    })) as { success?: boolean; results?: Array<{ success?: boolean; data?: unknown[] }> };
+    const inner = r?.results?.[0];
+    if (!r?.success || !inner?.success) return null;
+    const out: Array<{ collection: string; field: string }> = [];
+    for (const row of inner.data ?? []) {
+      if (row && typeof row === "object" && "collection" in row && "field" in row) {
+        const rr = row as { collection: unknown; field: unknown };
+        out.push({ collection: String(rr.collection), field: String(rr.field) });
+      }
+    }
+    return out;
+  } catch {
+    return null;
+  }
 }
 
 const program = new Command();
@@ -245,6 +286,54 @@ migrationsGroup
       process.stdout.write(formatHuman(report) + "\n");
     }
     process.exit(counts.failed > 0 ? 1 : 0);
+  });
+
+migrationsGroup
+  .command("lint")
+  .description(
+    "Static check: every CREATE TABLE / ADD COLUMN in migrations/*.sql must be covered by a register manifest or a real (non-'unknown') snapshot field definition. No network calls.",
+  )
+  .option(
+    "--migrations-dir <path>",
+    "path to migrations/*.sql",
+    "./migrations",
+  )
+  .option(
+    "--register-dir <path>",
+    "path to migrations/register",
+    "./migrations/register",
+  )
+  .option(
+    "--snapshot-dir <path>",
+    "path to directus_config/snapshot",
+    "./directus_config/snapshot",
+  )
+  .option("--json", "emit JSON output")
+  .action(async (opts: {
+    migrationsDir: string;
+    registerDir: string;
+    snapshotDir: string;
+    json?: boolean;
+  }) => {
+    const { lintMigrations } = await import("./lint.js");
+    const { violations, scanned } = await lintMigrations({
+      migrationsDir: opts.migrationsDir,
+      registerDir: opts.registerDir,
+      snapshotDir: opts.snapshotDir,
+    });
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({ scanned, violations }, null, 2) + "\n");
+    } else if (violations.length === 0) {
+      process.stdout.write(`migrations lint: ${scanned} file(s) scanned, no violations.\n`);
+    } else {
+      process.stderr.write(
+        `migrations lint: ${violations.length} violation(s) across ${scanned} file(s):\n`,
+      );
+      for (const v of violations) {
+        process.stderr.write(`  ${v.file}: ${v.reason}\n`);
+      }
+    }
+    process.exit(violations.length === 0 ? 0 : 1);
   });
 
 program.parseAsync(process.argv).catch((e) => {
