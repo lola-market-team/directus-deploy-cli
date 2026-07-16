@@ -216,7 +216,7 @@ async function branchHintForTreeHash(repoRoot, ext, treeHash, reference) {
         .split("\n")
         .map((s) => s.trim())
         .filter((s) => s.length > 0 && !s.endsWith("/HEAD") && s !== `refs/remotes/${reference.replace(/^origin\//, "origin/")}`);
-    const path = `extensions/${ext}`;
+    const path = `extensions/${ext}/src`;
     const matches = [];
     for (const ref of branches) {
         const h = await gitTreeHash(repoRoot, ref, path);
@@ -243,12 +243,16 @@ export async function diffExtensions(input) {
         ? input.extensions
         : await listExtensions(input.repoRoot);
     // Tree-hash cache — one lookup per (sha, ext) pair, reused across targets.
+    // Compare `extensions/<ext>/src` (not the full folder): README, CHANGELOG,
+    // and other non-code changes shouldn't flag content drift because they
+    // don't ship to the built bundle. Consistent with build-info's stamp,
+    // which computes sourceCommit from `git log -- src`.
     const treeHashCache = new Map();
     const cachedTreeHash = async (ref, ext) => {
-        const key = `${ref}::extensions/${ext}`;
+        const key = `${ref}::extensions/${ext}/src`;
         if (treeHashCache.has(key))
             return treeHashCache.get(key);
-        const h = await gitTreeHash(input.repoRoot, ref, `extensions/${ext}`);
+        const h = await gitTreeHash(input.repoRoot, ref, `extensions/${ext}/src`);
         treeHashCache.set(key, h);
         return h;
     };
