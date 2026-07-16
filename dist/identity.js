@@ -44,6 +44,15 @@ function indexByName(rows) {
     }
     return map;
 }
+function collectIds(rows) {
+    const set = new Set();
+    for (const r of rows) {
+        const id = String(r.id ?? "");
+        if (id)
+            set.add(id);
+    }
+    return set;
+}
 function collectOpSyncIdIndex(localOps) {
     const map = new Map();
     for (const op of localOps) {
@@ -86,25 +95,39 @@ export async function buildIdentity(client, localPolicies, localRoles, localFlow
         roleSyncIdToName: collectNames(localRoles),
         serverPolicyIdByName: indexByName(serverPolicies),
         serverRoleIdByName: indexByName(serverRoles),
+        serverPolicyIds: collectIds(serverPolicies),
+        serverRoleIds: collectIds(serverRoles),
         flowSyncIdToName: collectNames(localFlows),
         serverFlowIdByName: indexByName(serverFlows),
+        serverFlowIds: collectIds(serverFlows),
         opSyncIdToFlowAndKey: collectOpSyncIdIndex(localOps),
         serverOpIdByFlowIdAndKey: indexServerOps(serverOps),
+        serverOpIds: collectIds(serverOps),
     };
 }
+// Prefer UUID match (works when local _syncId == server id, which is the
+// Tractr-layout common case AND is robust to name collisions). Fall back to
+// name lookup for envs where the tool has to create rows fresh under a
+// different UUID.
 export function resolvePolicySyncIdToServerId(syncId, idx) {
+    if (idx.serverPolicyIds.has(syncId))
+        return syncId;
     const name = idx.policySyncIdToName.get(syncId);
     if (!name)
         return null;
     return idx.serverPolicyIdByName.get(name) ?? null;
 }
 export function resolveRoleSyncIdToServerId(syncId, idx) {
+    if (idx.serverRoleIds.has(syncId))
+        return syncId;
     const name = idx.roleSyncIdToName.get(syncId);
     if (!name)
         return null;
     return idx.serverRoleIdByName.get(name) ?? null;
 }
 export function resolveFlowSyncIdToServerId(syncId, idx) {
+    if (idx.serverFlowIds.has(syncId))
+        return syncId;
     const name = idx.flowSyncIdToName.get(syncId);
     if (!name)
         return null;

@@ -40,4 +40,18 @@ describe("identity", () => {
     const idx = await buildIdentity(mockClient([], []), local, []);
     expect(resolvePolicySyncIdToServerId("sync-x", idx)).toBeNull();
   });
+
+  it("uses UUID identity first so name collisions don't collapse two policies", async () => {
+    // Two policies share the exact same name — this is real in the wild
+    // (Codegen Web x2 on lola-market-backend). Prior name-only resolution
+    // sent both local rows to the same server row, causing permission
+    // oscillation on every `apply`. UUID-first resolution fixes that.
+    const localA = { _syncId: "a27b3dd9-2a14-43c1-bb93-3ae01606f936", name: "Codegen Web" };
+    const localB = { _syncId: "d57376cc-7e1c-4ccf-b211-6f041e4cb36f", name: "Codegen Web" };
+    const serverA = { id: "a27b3dd9-2a14-43c1-bb93-3ae01606f936", name: "Codegen Web" };
+    const serverB = { id: "d57376cc-7e1c-4ccf-b211-6f041e4cb36f", name: "Codegen Web" };
+    const idx = await buildIdentity(mockClient([serverA, serverB], []), [localA, localB], []);
+    expect(resolvePolicySyncIdToServerId(localA._syncId, idx)).toBe(serverA.id);
+    expect(resolvePolicySyncIdToServerId(localB._syncId, idx)).toBe(serverB.id);
+  });
 });
