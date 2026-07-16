@@ -133,7 +133,7 @@ program
   .description(
     "Reconcile a Directus environment to the state described in directus_config/snapshot/. Per-entity, non-atomic.",
   )
-  .version("0.1.0");
+  .version("0.3.0");
 
 function attachCommon(cmd: Command): Command {
   return cmd
@@ -168,7 +168,7 @@ function attachCommon(cmd: Command): Command {
     )
     .option(
       "--migrations-dir <path>",
-      "path to migrations/*.sql (raw SQL, tracked in lola_deploy_migrations)",
+      "path to migrations/*.sql (raw SQL, tracked in _directus_deploy_migrations)",
       "./migrations",
     )
     .option("--json", "emit JSON report instead of human-readable");
@@ -192,6 +192,59 @@ attachCommon(program.command("verify"))
   )
   .action(async (_, cmd) => {
     process.exit(await execute({ dryRun: true, strict: true }, cmd.optsWithGlobals()));
+  });
+
+// migrations adopt: bootstrap the tracker on an env whose migrations were
+// applied via some prior mechanism. Inserts (filename, sha256) rows without
+// executing any SQL. Idempotent — re-adopting is a no-op when hashes match.
+const migrationsGroup = program
+  .command("migrations")
+  .description("migration-specific commands");
+
+migrationsGroup
+  .command("adopt")
+  .description(
+    "Insert current migrations/*.sql into the tracker WITHOUT running them. Use once per env when cutting over from a prior deploy mechanism.",
+  )
+  .option("--url <url>", "Directus base URL (env: DIRECTUS_URL)")
+  .option("--token <token>", "Directus admin token (env: DIRECTUS_TOKEN)")
+  .option("--target <label>", "friendly label for logs (default: URL hostname)")
+  .option(
+    "--migrations-dir <path>",
+    "path to migrations/*.sql",
+    "./migrations",
+  )
+  .option("--dry-run", "report what would be adopted, don't write")
+  .option("--json", "emit JSON report instead of human-readable")
+  .action(async (opts: {
+    url?: string;
+    token?: string;
+    target?: string;
+    migrationsDir: string;
+    dryRun?: boolean;
+    json?: boolean;
+  }) => {
+    const url = opts.url ?? process.env.DIRECTUS_URL;
+    const token = opts.token ?? process.env.DIRECTUS_TOKEN;
+    if (!url) throw new Error("--url or DIRECTUS_URL required");
+    if (!token) throw new Error("--token or DIRECTUS_TOKEN required");
+    const target = opts.target ?? new URL(url).hostname;
+    const client = createDirectusClient({ baseUrl: url, token });
+    const { adoptMigrations } = await import("./reconcilers/migrations.js");
+    const results = await adoptMigrations({
+      migrationsDir: opts.migrationsDir,
+      client,
+      opts: { dryRun: Boolean(opts.dryRun) },
+    });
+    const counts = { created: 0, updated: 0, unchanged: 0, skipped: 0, failed: 0 };
+    for (const r of results) counts[r.action] += 1;
+    const report = { target, results, counts };
+    if (opts.json) {
+      process.stdout.write(formatJson(report) + "\n");
+    } else {
+      process.stdout.write(formatHuman(report) + "\n");
+    }
+    process.exit(counts.failed > 0 ? 1 : 0);
   });
 
 program.parseAsync(process.argv).catch((e) => {
