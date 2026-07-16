@@ -174,7 +174,7 @@ program
   .description(
     "Reconcile a Directus environment to the state described in directus_config/snapshot/. Per-entity, non-atomic.",
   )
-  .version("0.3.0");
+  .version("0.5.0");
 
 function attachCommon(cmd: Command): Command {
   return cmd
@@ -334,6 +334,104 @@ migrationsGroup
       }
     }
     process.exit(violations.length === 0 ? 0 : 1);
+  });
+
+const extensionsGroup = program
+  .command("extensions")
+  .description("Extension deploy over plain SSH (no gcloud, no service account)");
+
+extensionsGroup
+  .command("push")
+  .description(
+    "Build extensions/<name> locally and rsync to the target VM. Atomically swaps dist/ so EXTENSIONS_AUTO_RELOAD picks it up, then verifies /<name>/_meta.",
+  )
+  .argument("[names...]", "extensions to push (default: --all)")
+  .requiredOption("--target <env>", "target env name from the targets file")
+  .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
+  .option("--repo-root <path>", "repo root (default: cwd)", process.cwd())
+  .option("--all", "push every extension (respects --targets-file)")
+  .option("--skip-build", "skip 'npm run build' — assume dist/ is up to date")
+  .action(async (names: string[], opts: {
+    target: string;
+    targetsFile: string;
+    repoRoot: string;
+    all?: boolean;
+    skipBuild?: boolean;
+  }) => {
+    const { pushExtension } = await import("./extensions.js");
+    let list = names;
+    if ((!list || list.length === 0) && opts.all) {
+      const { readdir } = await import("node:fs/promises");
+      const { existsSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const entries = await readdir(join(opts.repoRoot, "extensions"));
+      list = entries.filter((e) => existsSync(join(opts.repoRoot, "extensions", e, "package.json"))).sort();
+    }
+    if (!list || list.length === 0) {
+      process.stderr.write("no extensions to push. Pass names or --all.\n");
+      process.exit(2);
+    }
+    let anyFailed = false;
+    for (const name of list) {
+      try {
+        process.stdout.write(`==> ${name} → ${opts.target}\n`);
+        const r = await pushExtension({
+          extensionName: name,
+          target: opts.target,
+          targetsFile: opts.targetsFile,
+          repoRoot: opts.repoRoot,
+          skipBuild: Boolean(opts.skipBuild),
+        });
+        const verify = r.verifiedCommit
+          ? r.verifiedCommit.startsWith(r.sourceCommit)
+            ? "✓ verified"
+            : `✗ /_meta reports ${r.verifiedCommit.slice(0, 8)}, expected ${r.sourceCommit.slice(0, 8)}`
+          : "⚠ /_meta not readable — verify manually";
+        process.stdout.write(
+          `    build=${r.buildDurationMs}ms rsync=${r.transportDurationMs}ms commit=${r.sourceCommit.slice(0, 8)} ${verify}\n`,
+        );
+        if (r.verifiedCommit && !r.verifiedCommit.startsWith(r.sourceCommit)) anyFailed = true;
+      } catch (e) {
+        anyFailed = true;
+        process.stderr.write(`    FAILED: ${(e as Error).message}\n`);
+      }
+    }
+    process.exit(anyFailed ? 1 : 0);
+  });
+
+extensionsGroup
+  .command("status")
+  .description(
+    "Query /<name>/_meta for each extension on the target and print the deployed sourceCommit + buildTime.",
+  )
+  .argument("[names...]", "extensions to check (default: all under ./extensions)")
+  .requiredOption("--target <env>", "target env name from the targets file")
+  .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
+  .option("--repo-root <path>", "repo root (default: cwd)", process.cwd())
+  .option("--json", "emit JSON")
+  .action(async (names: string[], opts: {
+    target: string;
+    targetsFile: string;
+    repoRoot: string;
+    json?: boolean;
+  }) => {
+    const { statusExtensions } = await import("./extensions.js");
+    const rows = await statusExtensions({
+      target: opts.target,
+      targetsFile: opts.targetsFile,
+      extensions: names.length ? names : undefined,
+      repoRoot: opts.repoRoot,
+    });
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(rows, null, 2) + "\n");
+    } else {
+      for (const row of rows) {
+        const commit = row.sourceCommit ? row.sourceCommit.slice(0, 8) : "-".repeat(8);
+        const err = row.error ? ` (${row.error})` : "";
+        process.stdout.write(`  ${row.name.padEnd(24)} ${commit}${err}\n`);
+      }
+    }
+    process.exit(0);
   });
 
 program.parseAsync(process.argv).catch((e) => {
