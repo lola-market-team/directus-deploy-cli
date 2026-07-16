@@ -174,7 +174,7 @@ program
   .description(
     "Reconcile a Directus environment to the state described in directus_config/snapshot/. Per-entity, non-atomic.",
   )
-  .version("0.7.0");
+  .version("0.8.0");
 
 function attachCommon(cmd: Command): Command {
   return cmd
@@ -394,6 +394,70 @@ snapshotGroup
       }
     }
     process.exit(report.offenders.length === 0 ? 0 : 1);
+  });
+
+snapshotGroup
+  .command("pull")
+  .description(
+    "Pull missing fields + relations from a Directus target and write them into directus_config/snapshot. Auto-detects drift (collections with a schema block but no fields dir). Drops phantom snapshot files that 403/404 on the target.",
+  )
+  .argument("[collections...]", "explicit collection names; default: auto-detect drift")
+  .option("--url <url>", "Directus base URL (env: DIRECTUS_URL)")
+  .option("--token <token>", "Directus admin token (env: DIRECTUS_TOKEN)")
+  .option(
+    "--snapshot-dir <path>",
+    "path to directus_config/snapshot",
+    "./directus_config/snapshot",
+  )
+  .option("--dry-run", "list drift + counts, don't write")
+  .option("--json", "emit JSON")
+  .action(async (collections: string[], opts: {
+    url?: string;
+    token?: string;
+    snapshotDir: string;
+    dryRun?: boolean;
+    json?: boolean;
+  }) => {
+    const url = opts.url ?? process.env.DIRECTUS_URL;
+    const token = opts.token ?? process.env.DIRECTUS_TOKEN;
+    if (!url) throw new Error("--url or DIRECTUS_URL required");
+    if (!token) throw new Error("--token or DIRECTUS_TOKEN required");
+    const client = createDirectusClient({ baseUrl: url, token });
+    const { pullSnapshot } = await import("./snapshot-pull.js");
+    const results = await pullSnapshot({
+      snapshotDir: opts.snapshotDir,
+      client,
+      targets: collections.length ? collections : undefined,
+      dryRun: Boolean(opts.dryRun),
+    });
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(results, null, 2) + "\n");
+    } else if (results.length === 0) {
+      process.stdout.write("✔ no drift — every data collection in snapshot has a fields dir\n");
+    } else {
+      for (const r of results) {
+        switch (r.action) {
+          case "pulled":
+          case "dry-run": {
+            const skip = r.fieldsSkipped ? ` (skipped ${r.fieldsSkipped} unregistered col)` : "";
+            process.stdout.write(
+              `  ${r.action === "dry-run" ? "would pull" : "pulled"} ${r.collection}: ${r.fieldsWritten} field(s), ${r.relationsWritten} relation(s)${skip}\n`,
+            );
+            break;
+          }
+          case "phantom":
+            process.stderr.write(
+              `  ${r.collection}: NOT ON target — ${r.droppedPath ? `dropped ${r.droppedPath}` : "no snapshot file to drop"}\n`,
+            );
+            break;
+          case "failed":
+            process.stderr.write(`  ${r.collection}: FAILED — ${r.error}\n`);
+            break;
+        }
+      }
+    }
+    const anyFailed = results.some((r) => r.action === "failed");
+    process.exit(anyFailed ? 1 : 0);
   });
 
 const extensionsGroup = program
