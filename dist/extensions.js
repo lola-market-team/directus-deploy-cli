@@ -191,4 +191,127 @@ export async function statusExtensions(input) {
     }
     return out;
 }
+async function gitBranchesContaining(repoRoot, sha) {
+    const r = await runCommand("git", ["-C", repoRoot, "branch", "-r", "--contains", sha]);
+    if (r.code !== 0)
+        return [];
+    return r.stdout
+        .split("\n")
+        .map((s) => s.replace(/^\*?\s+/, "").trim())
+        .filter((s) => s.length > 0 && !s.startsWith("origin/HEAD"));
+}
+async function gitReferenceContains(repoRoot, reference, sha) {
+    const r = await runCommand("git", ["-C", repoRoot, "merge-base", "--is-ancestor", sha, reference]);
+    return r.code === 0;
+}
+export async function diffExtensions(input) {
+    const cfg = await loadTargets(input.targetsFile);
+    const targetNames = input.targets?.length ? input.targets : Object.keys(cfg.targets);
+    const missing = targetNames.filter((t) => !cfg.targets[t]);
+    if (missing.length) {
+        throw new Error(`unknown target(s): ${missing.join(", ")}`);
+    }
+    const names = input.extensions?.length
+        ? input.extensions
+        : await listExtensions(input.repoRoot);
+    // Cache branch-contains + ancestor lookups per SHA (multiple targets may share a SHA).
+    const containsCache = new Map();
+    const ancestorCache = new Map();
+    const rows = [];
+    for (const ext of names) {
+        const row = { extension: ext, cells: {} };
+        for (const targetName of targetNames) {
+            const target = cfg.targets[targetName];
+            const url = `${target.base_url.replace(/\/+$/, "")}/${ext}/_meta`;
+            let sourceCommit = null;
+            let error;
+            try {
+                const r = await fetch(url);
+                if (r.ok) {
+                    const body = (await r.json());
+                    if (typeof body?.sourceCommit === "string")
+                        sourceCommit = body.sourceCommit;
+                }
+                else {
+                    error = `HTTP ${r.status}`;
+                }
+            }
+            catch (e) {
+                error = e.message;
+            }
+            let containingBranches = [];
+            let onReference = false;
+            if (sourceCommit) {
+                if (containsCache.has(sourceCommit)) {
+                    containingBranches = containsCache.get(sourceCommit);
+                }
+                else {
+                    containingBranches = await gitBranchesContaining(input.repoRoot, sourceCommit);
+                    containsCache.set(sourceCommit, containingBranches);
+                }
+                if (ancestorCache.has(sourceCommit)) {
+                    onReference = ancestorCache.get(sourceCommit);
+                }
+                else {
+                    onReference = await gitReferenceContains(input.repoRoot, input.reference, sourceCommit);
+                    ancestorCache.set(sourceCommit, onReference);
+                }
+            }
+            row.cells[targetName] = { target: targetName, sourceCommit, onReference, containingBranches, error };
+        }
+        rows.push(row);
+    }
+    return { reference: input.reference, targets: targetNames, rows };
+}
+// Human-friendly renderer for a DiffReport. Compact matrix — one row per
+// extension, one column per target, one final "state" summary.
+export function renderDiff(report) {
+    const nameCol = Math.max(9, ...report.rows.map((r) => r.extension.length));
+    const cellCol = 18;
+    const header = "extension".padEnd(nameCol) +
+        "  " +
+        report.targets.map((t) => t.padEnd(cellCol)).join("") +
+        "state";
+    const sep = "─".repeat(header.length);
+    const lines = [header, sep];
+    const shortSha = (s) => (s ? s.slice(0, 8) : "—       ");
+    for (const row of report.rows) {
+        const cells = report.targets.map((t) => {
+            const cell = row.cells[t];
+            if (!cell)
+                return "?               ".padEnd(cellCol);
+            if (cell.error)
+                return `err: ${cell.error}`.padEnd(cellCol);
+            if (!cell.sourceCommit)
+                return "not deployed".padEnd(cellCol);
+            const marker = cell.onReference ? "✓" : "✗";
+            return `${shortSha(cell.sourceCommit)} ${marker}`.padEnd(cellCol);
+        });
+        // Per-row state: aggregate across cells.
+        const deployedCells = report.targets.map((t) => row.cells[t]).filter((c) => c?.sourceCommit);
+        let state;
+        if (deployedCells.length === 0) {
+            state = "not deployed anywhere";
+        }
+        else if (deployedCells.every((c) => c.onReference)) {
+            state = `on ${report.reference}`;
+        }
+        else {
+            // Which targets are off-reference? Note the branches.
+            const off = report.targets
+                .map((t) => ({ t, c: row.cells[t] }))
+                .filter(({ c }) => c?.sourceCommit && !c.onReference);
+            const detail = off.map(({ t, c }) => {
+                const brs = (c.containingBranches || []).filter((b) => b !== report.reference);
+                const brief = brs.length === 1 ? brs[0] : brs.length ? `${brs.length} branches` : "unpushed?";
+                return `${t}=${brief}`;
+            });
+            state = detail.join(" ");
+        }
+        lines.push(row.extension.padEnd(nameCol) + "  " + cells.join("") + state);
+    }
+    lines.push("");
+    lines.push(`legend: ✓ = reachable from ${report.reference}   ✗ = not on ${report.reference}`);
+    return lines.join("\n");
+}
 //# sourceMappingURL=extensions.js.map

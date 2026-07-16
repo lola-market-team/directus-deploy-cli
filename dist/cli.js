@@ -131,7 +131,7 @@ const program = new Command();
 program
     .name("directus-deploy")
     .description("Reconcile a Directus environment to the state described in directus_config/snapshot/. Per-entity, non-atomic.")
-    .version("0.6.0");
+    .version("0.7.0");
 function attachCommon(cmd) {
     return cmd
         .option("--url <url>", "Directus base URL (env: DIRECTUS_URL)")
@@ -347,6 +347,33 @@ extensionsGroup
         }
     }
     process.exit(0);
+});
+extensionsGroup
+    .command("diff")
+    .description("Cross-env deploy matrix: one row per extension, one column per target. Shows deployed sourceCommit + whether it's reachable from a reference branch (default: origin/master). Surfaces WIP-on-test, staging-lag, unmerged branches in one call.")
+    .argument("[names...]", "extensions to check (default: all)")
+    .option("--targets <csv>", "restrict to these targets (default: every target in the file)")
+    .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
+    .option("--reference <ref>", "branch ref to check reachability against", "origin/master")
+    .option("--repo-root <path>", "repo root (default: cwd)", process.cwd())
+    .option("--json", "emit JSON")
+    .action(async (names, opts) => {
+    const { diffExtensions, renderDiff } = await import("./extensions.js");
+    const report = await diffExtensions({
+        targetsFile: opts.targetsFile,
+        reference: opts.reference,
+        repoRoot: opts.repoRoot,
+        extensions: names.length ? names : undefined,
+        targets: opts.targets ? opts.targets.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
+    });
+    if (opts.json) {
+        process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+    }
+    else {
+        process.stdout.write(renderDiff(report) + "\n");
+    }
+    const drift = report.rows.some((r) => Object.values(r.cells).some((c) => c.sourceCommit && !c.onReference));
+    process.exit(drift ? 1 : 0);
 });
 program.parseAsync(process.argv).catch((e) => {
     process.stderr.write(`directus-deploy: ${e.message}\n`);
