@@ -40,6 +40,12 @@ export interface MigrationReconcileInput {
   migrationsDir: string;
   client: DirectusClient;
   opts: ApplyOptions;
+  // Extension-migration support: when includeExtensions is true, also scan
+  // <extensionsDir>/*/migrations/*.sql and track them under keys of the form
+  // "ext/<name>/<filename>". Root migrations keep bare-filename tracker keys
+  // for backward compatibility.
+  extensionsDir?: string;
+  includeExtensions?: boolean;
 }
 
 interface RawQueryResult {
@@ -126,13 +132,14 @@ async function insertTrackerRow(
 }
 
 interface MigrationFile {
-  filename: string;
+  key: string;       // tracker PK. Root: bare filename. Extension: "ext/<name>/<filename>".
+  filename: string;  // basename only, for display.
   path: string;
   raw: string;
   hash: string;
 }
 
-async function readMigrationFiles(dir: string): Promise<MigrationFile[]> {
+async function readSqlDir(dir: string, keyPrefix: string): Promise<MigrationFile[]> {
   let entries: string[];
   try {
     entries = await readdir(dir);
@@ -144,9 +151,39 @@ async function readMigrationFiles(dir: string): Promise<MigrationFile[]> {
   for (const filename of names) {
     const path = join(dir, filename);
     const raw = await readFile(path, "utf8");
-    out.push({ filename, path, raw, hash: sha256(raw) });
+    out.push({
+      key: keyPrefix ? `${keyPrefix}${filename}` : filename,
+      filename,
+      path,
+      raw,
+      hash: sha256(raw),
+    });
   }
   return out;
+}
+
+async function readAllMigrations(input: MigrationReconcileInput): Promise<MigrationFile[]> {
+  const root = await readSqlDir(input.migrationsDir, "");
+  if (!input.includeExtensions) return root;
+
+  const extensionsDir = input.extensionsDir ?? "./extensions";
+  let extNames: string[];
+  try {
+    extNames = (await readdir(extensionsDir, { withFileTypes: true }))
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name)
+      .sort();
+  } catch {
+    return root;
+  }
+
+  const extFiles: MigrationFile[] = [];
+  for (const name of extNames) {
+    const dir = join(extensionsDir, name, "migrations");
+    const files = await readSqlDir(dir, `ext/${name}/`);
+    extFiles.push(...files);
+  }
+  return [...root, ...extFiles];
 }
 
 export async function reconcileMigrations(
@@ -165,7 +202,7 @@ export async function reconcileMigrations(
     return results;
   }
 
-  const files = await readMigrationFiles(input.migrationsDir);
+  const files = await readAllMigrations(input);
   if (files.length === 0) return results;
 
   // Tracker create is a schema mutation → do it only outside dry-run. In
@@ -186,8 +223,8 @@ export async function reconcileMigrations(
   const tracker = (await fetchTracker(input.client)) ?? new Map<string, string>();
 
   for (const file of files) {
-    const label = `migrations/${file.filename}`;
-    const recordedHash = tracker.get(file.filename);
+    const label = `migrations/${file.key}`;
+    const recordedHash = tracker.get(file.key);
 
     // UNCHANGED — already applied at this hash.
     if (recordedHash === file.hash) {
@@ -241,7 +278,7 @@ export async function reconcileMigrations(
       continue;
     }
 
-    const rec = await insertTrackerRow(input.client, file.filename, file.hash);
+    const rec = await insertTrackerRow(input.client, file.key, file.hash);
     if (!rec.ok) {
       results.push({
         kind: "migrations",
@@ -277,7 +314,7 @@ export async function adoptMigrations(
     return results;
   }
 
-  const files = await readMigrationFiles(input.migrationsDir);
+  const files = await readAllMigrations(input);
   if (files.length === 0) return results;
 
   if (!input.opts.dryRun) {
@@ -296,8 +333,8 @@ export async function adoptMigrations(
   const tracker = (await fetchTracker(input.client)) ?? new Map<string, string>();
 
   for (const file of files) {
-    const label = `migrations/${file.filename}`;
-    const recordedHash = tracker.get(file.filename);
+    const label = `migrations/${file.key}`;
+    const recordedHash = tracker.get(file.key);
 
     if (recordedHash === file.hash) {
       results.push({ kind: "migrations", label, action: "unchanged" });
@@ -323,7 +360,7 @@ export async function adoptMigrations(
       continue;
     }
 
-    const rec = await insertTrackerRow(input.client, file.filename, file.hash);
+    const rec = await insertTrackerRow(input.client, file.key, file.hash);
     if (!rec.ok) {
       results.push({
         kind: "migrations",

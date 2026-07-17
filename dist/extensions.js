@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
+const DEFAULT_ARTIFACT_BUCKET = "gs://lola-market-extensions";
 async function loadTargets(path) {
     const raw = await readFile(path, "utf8");
     const parsed = JSON.parse(raw);
@@ -30,8 +31,13 @@ async function assertCommand(cmd, args, opts = {}) {
     return r;
 }
 async function resolveSourceCommit(repoRoot, extName) {
-    // Match scripts/deploy-extension.sh:
-    //   git -C <root> log -1 --format=%h -- extensions/<name> :!extensions/<name>/dist :!extensions/<name>/src/build-info.ts
+    // Match packages/build-info/bin/stamp-build-info.mjs — the stamper is the
+    // source of truth for what ends up in /_meta.sourceCommit. Both scoped
+    // to `src/` so non-src changes (package.json version bumps, dependency
+    // updates, tests) don't produce a phantom expected-vs-stamped mismatch
+    // that verifyMeta could never resolve — this was the actual bug behind
+    // the "chokidar reload false-negative" theory (runs 29525123627,
+    // 29523531092, 29524916438 on 2026-07-16).
     const r = await assertCommand("git", [
         "-C",
         repoRoot,
@@ -39,9 +45,7 @@ async function resolveSourceCommit(repoRoot, extName) {
         "-1",
         "--format=%H",
         "--",
-        `extensions/${extName}`,
-        `:!extensions/${extName}/dist`,
-        `:!extensions/${extName}/src/build-info.ts`,
+        `extensions/${extName}/src`,
     ], { label: "git log source commit" });
     const commit = r.stdout.trim();
     if (!commit)
@@ -85,24 +89,52 @@ async function rsyncToRemote(target, localPath, remotePath) {
         throw new Error(`rsync exited ${r.code}: ${r.stderr.trim() || r.stdout.trim()}`);
     }
 }
-async function verifyMeta(baseUrl, extName) {
+// Two SHAs match if either is a prefix of the other. Handles the common
+// full-vs-short (%H vs %h) length mismatch between git log callers and
+// the build-info stamper.
+export function shaMatch(a, b) {
+    return a.startsWith(b) || b.startsWith(a);
+}
+async function verifyMeta(baseUrl, extName, expectedCommit) {
     const url = `${baseUrl.replace(/\/+$/, "")}/${extName}/_meta`;
-    try {
-        // Poll for up to 20 s while the hot-reload picks up the swap.
-        for (let i = 0; i < 10; i++) {
+    // Poll for up to 60 s while chokidar picks up the atomic swap. Empirically
+    // the hot-reload can take 15–30 s under load (larger bundles, cold VM),
+    // and firing once at 20 s produces the false-negative pattern seen in run
+    // 29525123627 (2026-07-16): /_meta reports the previous sourceCommit,
+    // deploy is reported failed, then a manual re-probe 10 s later confirms
+    // the new commit is live.
+    //
+    // If expectedCommit is provided, keep polling until /_meta reports it
+    // (i.e. don't return early on the stale pre-reload value). Falls back to
+    // returning the last-seen sourceCommit at timeout so the caller can
+    // surface a real mismatch when the deploy actually didn't take.
+    let lastSeen = null;
+    const attempts = 20; // 20 × 3s = 60 s
+    for (let i = 0; i < attempts; i++) {
+        try {
             const r = await fetch(url);
             if (r.ok) {
                 const body = (await r.json());
-                if (body?.sourceCommit)
-                    return body.sourceCommit;
+                if (body?.sourceCommit) {
+                    lastSeen = body.sourceCommit;
+                    // Full-SHA (git log %H) vs short-SHA (%h from stamper): either
+                    // direction is a legitimate prefix match. Comparing only one way
+                    // was the actual bug — verifier "expected fcaa23ff (full)" and
+                    // /_meta reported "fcaa23ff (short)"; short.startsWith(long) was
+                    // always false, producing a phantom mismatch even when the deploy
+                    // was clean.
+                    if (!expectedCommit || shaMatch(body.sourceCommit, expectedCommit)) {
+                        return body.sourceCommit;
+                    }
+                }
             }
-            await new Promise((res) => setTimeout(res, 2000));
         }
+        catch {
+            // network flake — keep trying
+        }
+        await new Promise((res) => setTimeout(res, 3000));
     }
-    catch {
-        return null;
-    }
-    return null;
+    return lastSeen;
 }
 export async function pushExtension(input) {
     const cfg = await loadTargets(input.targetsFile);
@@ -116,14 +148,64 @@ export async function pushExtension(input) {
         throw new Error(`no such extension: ${input.extensionName} (looked at ${extDir})`);
     }
     const sourceCommit = await resolveSourceCommit(repoRoot, input.extensionName);
+    // Publish artifacts against the SAME short-sha convention as
+    // scripts/build-extension.sh — that's what promote (and today's bash) look
+    // up in the bucket. Refuse a dirty tree when publishing unless allowDirty:
+    // an artifact for a commit that doesn't reflect the source tree is a lie
+    // future promotes can't detect.
+    let artifactSourceCommit = null;
+    if (input.publish) {
+        artifactSourceCommit = await resolveArtifactSourceCommit(repoRoot, input.extensionName);
+        if (!input.allowDirty) {
+            const dirty = await worktreeDirty(repoRoot, input.extensionName);
+            if (dirty) {
+                throw new Error(`refusing to publish ${input.extensionName}: source tree is dirty (pass --allow-dirty to override)\n${dirty}`);
+            }
+        }
+    }
     const buildStart = Date.now();
+    let stamped = false;
     if (!input.skipBuild) {
-        await build(extDir);
+        // Publishing: stamp build-info first so the running bundle reports the
+        // exact commit the artifact filename claims. Push-only (no publish)
+        // keeps today's behavior — the extension's own build step handles
+        // stamping (or doesn't; it's a caller concern for non-publish flows).
+        if (input.publish) {
+            stamped = await stampBuildInfo(repoRoot, extDir);
+        }
+        try {
+            await build(extDir);
+        }
+        finally {
+            if (stamped)
+                await restoreStampedFile(repoRoot, input.extensionName);
+        }
     }
     const buildDurationMs = Date.now() - buildStart;
     const distPath = join(extDir, "dist");
     if (!existsSync(distPath)) {
         throw new Error(`no dist/ at ${distPath} — did the build succeed?`);
+    }
+    // Publish BEFORE rsync so a rsync failure doesn't leave a promoted-but-
+    // untransported artifact. Alreadyexists → reuse (first-write-wins).
+    let artifact;
+    if (input.publish) {
+        const bucket = targetArtifactBucket(target);
+        const uploadStart = Date.now();
+        const r = await publishTarball({
+            repoRoot,
+            extName: input.extensionName,
+            extDir,
+            bucket,
+            sourceCommit: artifactSourceCommit,
+            force: Boolean(input.force),
+        });
+        artifact = {
+            uri: r.artifactUri,
+            sha256: r.sha256,
+            alreadyPublished: r.alreadyPublished,
+            uploadDurationMs: Date.now() - uploadStart,
+        };
     }
     const remoteBase = target.remote_extensions_path.replace(/\/+$/, "");
     const remoteFinal = `${remoteBase}/${input.extensionName}/dist`;
@@ -138,12 +220,197 @@ export async function pushExtension(input) {
         `mv ${remoteStage} ${remoteFinal}; ` +
         `rm -rf ${remoteFinal}_prev`);
     const transportDurationMs = Date.now() - transportStart;
-    const verifiedCommit = await verifyMeta(target.base_url, input.extensionName);
+    const verifiedCommit = await verifyMeta(target.base_url, input.extensionName, sourceCommit);
     return {
         extensionName: input.extensionName,
         target: input.target,
         sourceCommit,
         buildDurationMs,
+        transportDurationMs,
+        verifiedCommit,
+        artifact,
+    };
+}
+// -------------------- artifact publish / promote --------------------
+// build-once/promote-many. `push --publish` uploads the built tarball to
+// gs://<bucket>/<name>/<short-sha>.tgz alongside a .sha256 sidecar; `promote`
+// resolves the SAME short-sha for the current source tree and pulls THAT
+// exact tarball to the target VM. Prod never builds — it only promotes.
+//
+// The short-SHA + scoped source commit convention is deliberately identical
+// to scripts/build-extension.sh so today's published artifacts stay
+// resolvable by whichever tool a caller happens to use.
+async function resolveArtifactSourceCommit(repoRoot, extName) {
+    // Match scripts/build-extension.sh: last commit touching extensions/<name>/,
+    // EXCLUDING dist/ (build output) and the stamped build-info placeholder.
+    // Short (%h) — that's what the artifact filename uses in the bucket.
+    const r = await assertCommand("git", [
+        "-C",
+        repoRoot,
+        "log",
+        "-1",
+        "--format=%h",
+        "--",
+        `extensions/${extName}`,
+        `:!extensions/${extName}/dist`,
+        `:!extensions/${extName}/src/build-info.ts`,
+    ], { label: "git log artifact source commit" });
+    const commit = r.stdout.trim();
+    if (!commit)
+        throw new Error(`could not resolve artifact source commit for ${extName}`);
+    return commit;
+}
+async function worktreeDirty(repoRoot, extName) {
+    // Uncommitted changes under the extension, excluding dist/ + build-info.ts.
+    // Same scope as build-extension.sh's --allow-dirty check.
+    const r = await runCommand("git", [
+        "-C",
+        repoRoot,
+        "status",
+        "--porcelain",
+        "--",
+        `extensions/${extName}`,
+        `:!extensions/${extName}/dist`,
+        `:!extensions/${extName}/src/build-info.ts`,
+    ]);
+    return r.code === 0 ? r.stdout.trim() : "";
+}
+async function stampBuildInfo(repoRoot, extDir) {
+    // Repo-owned stamper (packages/build-info/bin/stamp-build-info.mjs) writes
+    // the sourceCommit that ends up in /_meta. If it exists, run it before
+    // build so the artifact's stamped commit matches its filename. Missing
+    // stamper is not an error — some repos don't use build-info.
+    const stamper = join(repoRoot, "packages", "build-info", "bin", "stamp-build-info.mjs");
+    if (!existsSync(stamper))
+        return false;
+    await assertCommand("node", [stamper, extDir], { label: `stamp-build-info ${extDir}` });
+    return true;
+}
+async function restoreStampedFile(repoRoot, extName) {
+    // Restore the committed dev placeholder after build. Tolerate a not-yet-
+    // committed file (fresh extension).
+    const file = `extensions/${extName}/src/build-info.ts`;
+    await runCommand("git", ["-C", repoRoot, "checkout", "--", file]);
+}
+function targetArtifactBucket(target) {
+    return (target.artifact_bucket ?? DEFAULT_ARTIFACT_BUCKET).replace(/\/+$/, "");
+}
+async function gsutilStatExists(uri) {
+    const r = await runCommand("gsutil", ["-q", "stat", uri]);
+    return r.code === 0;
+}
+async function publishTarball(input) {
+    const { repoRoot, extName, extDir, bucket, sourceCommit, force } = input;
+    const artifactUri = `${bucket}/${extName}/${sourceCommit}.tgz`;
+    if (!force && (await gsutilStatExists(artifactUri))) {
+        // First-write-wins. The existing artifact is authoritative: rebuild + reupload
+        // would break the byte-identity guarantee across envs.
+        // Best-effort sha lookup from the sidecar; empty string if missing.
+        const r = await runCommand("gsutil", ["cat", `${artifactUri}.sha256`]);
+        const sha = r.code === 0 ? (r.stdout.trim().split(/\s+/)[0] ?? "") : "";
+        return { artifactUri, sha256: sha, alreadyPublished: true };
+    }
+    const { mkdtemp, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const stage = await mkdtemp(join(tmpdir(), `dd-artifact-${extName}-`));
+    const tarball = join(stage, `${sourceCommit}.tgz`);
+    // COPYFILE_DISABLE + --no-mac-metadata strip Darwin's AppleDouble headers
+    // so GNU tar on the VM doesn't spew "Ignoring unknown extended header
+    // keyword" warnings on extract. Matches scripts/build-extension.sh.
+    const isDarwin = process.platform === "darwin";
+    const tarArgs = ["-C", extDir];
+    if (isDarwin)
+        tarArgs.push("--no-mac-metadata");
+    tarArgs.push("-cf", "-", "dist", "package.json");
+    // tar → gzip → file. Two-child pipeline; keep it simple with shell.
+    const cmd = `COPYFILE_DISABLE=1 tar ${tarArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ")} | gzip -n > '${tarball.replace(/'/g, "'\\''")}'`;
+    const rTar = await runCommand("sh", ["-c", cmd]);
+    if (rTar.code !== 0) {
+        throw new Error(`tar/gzip failed: ${rTar.stderr.trim() || rTar.stdout.trim()}`);
+    }
+    // sha256 (uses shasum on macOS, sha256sum on Linux).
+    const shaBin = isDarwin ? "shasum" : "sha256sum";
+    const shaArgs = isDarwin ? ["-a", "256", tarball] : [tarball];
+    const rSha = await assertCommand(shaBin, shaArgs, { label: `sha256 ${tarball}` });
+    const sha = rSha.stdout.trim().split(/\s+/)[0] ?? "";
+    if (!sha)
+        throw new Error(`could not compute sha256 for ${tarball}`);
+    const shaFile = `${tarball}.sha256`;
+    await writeFile(shaFile, `${sha}  ${extName}/${sourceCommit}.tgz\n`, "utf8");
+    // Upload atomically-adjacent (tarball first, sha256 second). Race window:
+    // a promoter reading between the two uploads gets the tarball without the
+    // sidecar — promote code tolerates missing sha256 (best-effort verify).
+    await assertCommand("gsutil", ["-q", "cp", tarball, artifactUri], {
+        label: `gsutil cp → ${artifactUri}`,
+    });
+    await assertCommand("gsutil", ["-q", "cp", shaFile, `${artifactUri}.sha256`], {
+        label: `gsutil cp → ${artifactUri}.sha256`,
+    });
+    return { artifactUri, sha256: sha, alreadyPublished: false };
+}
+export async function promoteExtension(input) {
+    const cfg = await loadTargets(input.targetsFile);
+    const target = cfg.targets[input.target];
+    if (!target) {
+        throw new Error(`unknown target '${input.target}' — known: ${Object.keys(cfg.targets).join(", ") || "(none)"}`);
+    }
+    const repoRoot = resolve(input.repoRoot);
+    const extDir = join(repoRoot, "extensions", input.extensionName);
+    if (!existsSync(extDir)) {
+        throw new Error(`no such extension: ${input.extensionName} (looked at ${extDir})`);
+    }
+    const sourceCommit = input.sourceCommit ?? (await resolveArtifactSourceCommit(repoRoot, input.extensionName));
+    const bucket = targetArtifactBucket(target);
+    const artifactUri = `${bucket}/${input.extensionName}/${sourceCommit}.tgz`;
+    if (!(await gsutilStatExists(artifactUri))) {
+        // Prod-like targets never build — the artifact must already exist,
+        // proving it was validated on a lower env for the same source commit.
+        const hint = target.build_forbidden
+            ? `\n  ${input.target} is build-forbidden — promote a commit already published to a lower env, or publish first: directus-deploy extensions push ${input.extensionName} --target <lower-env> --publish`
+            : `\n  publish it first: directus-deploy extensions push ${input.extensionName} --target <build-env> --publish`;
+        throw new Error(`no artifact at ${artifactUri}${hint}`);
+    }
+    const remoteBase = target.remote_extensions_path.replace(/\/+$/, "");
+    const remoteExt = `${remoteBase}/${input.extensionName}`;
+    const transportStart = Date.now();
+    // Fetch + verify + unpack + install per-file — chokidar hot-reload watches
+    // per-file inodes, so a full dist/ dir-swap changes the dist inode and the
+    // watch never fires (see comments in scripts/deploy-extension.sh). Per-file
+    // mv-in-place is atomic AND chokidar-friendly. VMs have gsutil (prod
+    // backup cron uses it).
+    await ssh(target, `set -e; ` +
+        `mkdir -p ${remoteExt}/dist; ` +
+        `TMPDIR=$(mktemp -d); ` +
+        `gsutil -q cp '${artifactUri}' "$TMPDIR/artifact.tgz"; ` +
+        `gsutil -q cp '${artifactUri}.sha256' "$TMPDIR/artifact.sha256" || true; ` +
+        `if [ -s "$TMPDIR/artifact.sha256" ]; then ` +
+        `  want=$(awk '{print $1}' "$TMPDIR/artifact.sha256"); ` +
+        `  got=$(sha256sum "$TMPDIR/artifact.tgz" | awk '{print $1}'); ` +
+        `  if [ "$want" != "$got" ]; then echo "sha256 mismatch: want $want got $got" >&2; exit 1; fi; ` +
+        `fi; ` +
+        `tar -C "$TMPDIR" -xzf "$TMPDIR/artifact.tgz"; ` +
+        // Per-file atomic mv into dist/. Stale files (removed from the artifact
+        // between builds) are cleared first so a shrinking bundle doesn't leave
+        // orphaned entry-points behind.
+        `find ${remoteExt}/dist -maxdepth 1 -type f -name '*.js' -delete; ` +
+        `for f in "$TMPDIR"/dist/*.js; do ` +
+        `  base=$(basename "$f"); ` +
+        `  cp "$f" "${remoteExt}/dist/.$base.new"; ` +
+        `  mv "${remoteExt}/dist/.$base.new" "${remoteExt}/dist/$base"; ` +
+        `done; ` +
+        // package.json lives in the extension root (bundle-entry discovery).
+        `if [ -f "$TMPDIR/package.json" ]; then ` +
+        `  cp "$TMPDIR/package.json" "${remoteExt}/package.json.new"; ` +
+        `  mv "${remoteExt}/package.json.new" "${remoteExt}/package.json"; ` +
+        `fi; ` +
+        `rm -rf "$TMPDIR"`);
+    const transportDurationMs = Date.now() - transportStart;
+    const verifiedCommit = await verifyMeta(target.base_url, input.extensionName, sourceCommit);
+    return {
+        extensionName: input.extensionName,
+        target: input.target,
+        sourceCommit,
+        artifactUri,
         transportDurationMs,
         verifiedCommit,
     };

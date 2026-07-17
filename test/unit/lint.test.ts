@@ -51,7 +51,24 @@ describe("lintMigrations", () => {
     expect(violations).toEqual([]);
   });
 
-  it("passes when ADD COLUMN is covered by a snapshot field with a real type", async () => {
+  it("passes when ADD COLUMN IF NOT EXISTS is paired with a snapshot field (belt-and-suspenders)", async () => {
+    // Tightened rule: an unguarded ADD COLUMN alongside a snapshot field is a
+    // double-writer — POST /fields creates the column first, then the migration
+    // re-runs and 500s. Belt-and-suspenders: keep the snapshot field AND make
+    // the migration idempotent with IF NOT EXISTS.
+    const dirs = await scratch({
+      "migrations/001.sql": `ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname text;`,
+      "snapshot/fields/users/nickname.json": JSON.stringify({
+        collection: "users",
+        field: "nickname",
+        type: "string",
+      }),
+    });
+    const { violations } = await lintMigrations(dirs);
+    expect(violations).toEqual([]);
+  });
+
+  it("fails when an unguarded ADD COLUMN collides with a snapshot field", async () => {
     const dirs = await scratch({
       "migrations/001.sql": `ALTER TABLE users ADD COLUMN nickname text;`,
       "snapshot/fields/users/nickname.json": JSON.stringify({
@@ -61,7 +78,8 @@ describe("lintMigrations", () => {
       }),
     });
     const { violations } = await lintMigrations(dirs);
-    expect(violations).toEqual([]);
+    expect(violations.length).toBe(1);
+    expect(violations[0]).toMatchObject({ file: "001.sql", table: "users", column: "nickname" });
   });
 
   it("fails when snapshot field has type='unknown' (must add manifest)", async () => {

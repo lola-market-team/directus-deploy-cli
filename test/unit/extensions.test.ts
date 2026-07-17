@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pushExtension, statusExtensions } from "../../src/extensions.js";
+import { pushExtension, promoteExtension, statusExtensions } from "../../src/extensions.js";
 
 async function scratchRepo(files: Record<string, string>): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "ext-"));
@@ -47,6 +47,41 @@ describe("pushExtension errors", () => {
         targetsFile: `${root}/directus-deploy.targets.json`,
         repoRoot: root,
         skipBuild: true,
+      }),
+    ).rejects.toThrow(/no such extension: missing/);
+  });
+});
+
+describe("promoteExtension errors", () => {
+  it("errors when the targets file has no matching target", async () => {
+    const root = await scratchRepo({
+      "extensions/chat/package.json": "{}",
+      "directus-deploy.targets.json": JSON.stringify({
+        targets: { test: { base_url: "https://x", ssh_host: "y", ssh_user: "runner", remote_extensions_path: "/opt" } },
+      }),
+    });
+    await expect(
+      promoteExtension({
+        extensionName: "chat",
+        target: "prod",
+        targetsFile: `${root}/directus-deploy.targets.json`,
+        repoRoot: root,
+      }),
+    ).rejects.toThrow(/unknown target 'prod'/);
+  });
+
+  it("errors when the extension directory doesn't exist", async () => {
+    const root = await scratchRepo({
+      "directus-deploy.targets.json": JSON.stringify({
+        targets: { prod: { base_url: "https://x", ssh_host: "y", ssh_user: "runner", remote_extensions_path: "/opt", build_forbidden: true } },
+      }),
+    });
+    await expect(
+      promoteExtension({
+        extensionName: "missing",
+        target: "prod",
+        targetsFile: `${root}/directus-deploy.targets.json`,
+        repoRoot: root,
       }),
     ).rejects.toThrow(/no such extension: missing/);
   });

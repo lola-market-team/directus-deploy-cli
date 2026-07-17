@@ -58,10 +58,10 @@ async function readManifests(
 // ADD COLUMN clause independently.
 function parseSql(sql: string): {
   createTables: string[];
-  addColumns: Array<{ table: string; column: string }>;
+  addColumns: Array<{ table: string; column: string; ifNotExists: boolean }>;
 } {
   const createTables: string[] = [];
-  const addColumns: Array<{ table: string; column: string }> = [];
+  const addColumns: Array<{ table: string; column: string; ifNotExists: boolean }> = [];
 
   // Strip block + line comments to simplify matching. We keep offsets rough —
   // this is a lint, not a compiler.
@@ -77,21 +77,23 @@ function parseSql(sql: string): {
   }
 
   // Find each `ALTER TABLE <t> …` block, then within that block find every
-  // `ADD COLUMN (IF NOT EXISTS)? <c>`. This handles the common
-  //   ALTER TABLE t
-  //     ADD COLUMN a int,
-  //     ADD COLUMN b int;
-  // shape.
+  // `ADD COLUMN (IF NOT EXISTS)? <c>`. Track the guard per-column so callers
+  // can distinguish belt-and-suspenders (safe idiom with snapshot field) from
+  // an unguarded double-write (will 500 on apply).
   const alterRe =
     /\bALTER\s+TABLE\s+(?:ONLY\s+)?"?([a-z_][a-z0-9_]*)"?\s*([\s\S]*?);/gi;
   while ((m = alterRe.exec(stripped)) !== null) {
     const table = m[1]!.toLowerCase();
     const body = m[2]!;
     const colRe =
-      /\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?"?([a-z_][a-z0-9_]*)"?/gi;
+      /\bADD\s+COLUMN\s+(IF\s+NOT\s+EXISTS\s+)?"?([a-z_][a-z0-9_]*)"?/gi;
     let cm: RegExpExecArray | null;
     while ((cm = colRe.exec(body)) !== null) {
-      addColumns.push({ table, column: cm[1]!.toLowerCase() });
+      addColumns.push({
+        table,
+        column: cm[2]!.toLowerCase(),
+        ifNotExists: !!cm[1],
+      });
     }
   }
 
@@ -152,7 +154,7 @@ export async function lintMigrations(
       }
     }
 
-    for (const { table, column } of addColumns) {
+    for (const { table, column, ifNotExists } of addColumns) {
       // Manifest match: table is listed AND either fields[column] exists or
       // fields is undefined (walk-all-unregistered mode).
       const manifest = manifests.get(table);
@@ -160,10 +162,34 @@ export async function lintMigrations(
         !!manifest &&
         (manifest.fields === undefined ||
           Object.prototype.hasOwnProperty.call(manifest.fields, column));
-      if (manifestCovers) continue;
 
       const snapshotType = await fieldSnapshotType(input.snapshotDir, table, column);
-      if (snapshotType && snapshotType !== "unknown") continue;
+      const snapshotCovers = !!snapshotType && snapshotType !== "unknown";
+
+      // Double-write with a snapshot field:
+      //   - Guarded (IF NOT EXISTS): legitimate belt-and-suspenders idiom.
+      //     POST /fields creates the column first (config-first ordering);
+      //     the migration's IF NOT EXISTS clause is a no-op. Common when a
+      //     migration exists to backfill / set a default the snapshot can't
+      //     express. Not a violation.
+      //   - Unguarded: the reason today's digests PR failed. Whichever step
+      //     runs second hits `500 column already exists`. Hard error.
+      if (snapshotCovers && !ifNotExists) {
+        violations.push({
+          kind: "column",
+          file: f,
+          table,
+          column,
+          reason: `${table}.${column} — unguarded ADD COLUMN conflicts with snapshot field (type=${snapshotType}). Either add IF NOT EXISTS to the ADD COLUMN (belt-and-suspenders idiom, POST /fields creates the column first), or remove the ADD COLUMN entirely (let the snapshot field be the sole writer).`,
+        });
+        continue;
+      }
+      if (snapshotCovers && ifNotExists) {
+        // belt-and-suspenders idiom, safe; snapshot owns the column.
+        continue;
+      }
+
+      if (manifestCovers) continue;
 
       violations.push({
         kind: "column",

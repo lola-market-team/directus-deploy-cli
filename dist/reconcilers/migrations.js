@@ -105,7 +105,7 @@ async function insertTrackerRow(client, filename, hash) {
     }
     return { ok: true };
 }
-async function readMigrationFiles(dir) {
+async function readSqlDir(dir, keyPrefix) {
     let entries;
     try {
         entries = await readdir(dir);
@@ -118,9 +118,38 @@ async function readMigrationFiles(dir) {
     for (const filename of names) {
         const path = join(dir, filename);
         const raw = await readFile(path, "utf8");
-        out.push({ filename, path, raw, hash: sha256(raw) });
+        out.push({
+            key: keyPrefix ? `${keyPrefix}${filename}` : filename,
+            filename,
+            path,
+            raw,
+            hash: sha256(raw),
+        });
     }
     return out;
+}
+async function readAllMigrations(input) {
+    const root = await readSqlDir(input.migrationsDir, "");
+    if (!input.includeExtensions)
+        return root;
+    const extensionsDir = input.extensionsDir ?? "./extensions";
+    let extNames;
+    try {
+        extNames = (await readdir(extensionsDir, { withFileTypes: true }))
+            .filter((d) => d.isDirectory())
+            .map((d) => d.name)
+            .sort();
+    }
+    catch {
+        return root;
+    }
+    const extFiles = [];
+    for (const name of extNames) {
+        const dir = join(extensionsDir, name, "migrations");
+        const files = await readSqlDir(dir, `ext/${name}/`);
+        extFiles.push(...files);
+    }
+    return [...root, ...extFiles];
 }
 export async function reconcileMigrations(input) {
     const results = [];
@@ -134,7 +163,7 @@ export async function reconcileMigrations(input) {
         });
         return results;
     }
-    const files = await readMigrationFiles(input.migrationsDir);
+    const files = await readAllMigrations(input);
     if (files.length === 0)
         return results;
     // Tracker create is a schema mutation → do it only outside dry-run. In
@@ -153,8 +182,8 @@ export async function reconcileMigrations(input) {
     }
     const tracker = (await fetchTracker(input.client)) ?? new Map();
     for (const file of files) {
-        const label = `migrations/${file.filename}`;
-        const recordedHash = tracker.get(file.filename);
+        const label = `migrations/${file.key}`;
+        const recordedHash = tracker.get(file.key);
         // UNCHANGED — already applied at this hash.
         if (recordedHash === file.hash) {
             results.push({ kind: "migrations", label, action: "unchanged" });
@@ -201,7 +230,7 @@ export async function reconcileMigrations(input) {
             results.push({ kind: "migrations", label, action: "failed", reason: failedReason });
             continue;
         }
-        const rec = await insertTrackerRow(input.client, file.filename, file.hash);
+        const rec = await insertTrackerRow(input.client, file.key, file.hash);
         if (!rec.ok) {
             results.push({
                 kind: "migrations",
@@ -231,7 +260,7 @@ export async function adoptMigrations(input) {
         });
         return results;
     }
-    const files = await readMigrationFiles(input.migrationsDir);
+    const files = await readAllMigrations(input);
     if (files.length === 0)
         return results;
     if (!input.opts.dryRun) {
@@ -248,8 +277,8 @@ export async function adoptMigrations(input) {
     }
     const tracker = (await fetchTracker(input.client)) ?? new Map();
     for (const file of files) {
-        const label = `migrations/${file.filename}`;
-        const recordedHash = tracker.get(file.filename);
+        const label = `migrations/${file.key}`;
+        const recordedHash = tracker.get(file.key);
         if (recordedHash === file.hash) {
             results.push({ kind: "migrations", label, action: "unchanged" });
             continue;
@@ -272,7 +301,7 @@ export async function adoptMigrations(input) {
             });
             continue;
         }
-        const rec = await insertTrackerRow(input.client, file.filename, file.hash);
+        const rec = await insertTrackerRow(input.client, file.key, file.hash);
         if (!rec.ok) {
             results.push({
                 kind: "migrations",

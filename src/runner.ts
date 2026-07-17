@@ -27,6 +27,8 @@ export interface RunInput {
   target: string;
   paths: SnapshotPaths;
   migrationsDir?: string;
+  extensionsDir?: string;
+  includeExtensions?: boolean;
   seedDir?: string;
   client: DirectusClient;
   opts: ApplyOptions;
@@ -56,6 +58,8 @@ export async function run(input: RunInput): Promise<RunReport> {
     results.push(
       ...(await reconcileMigrations({
         migrationsDir: input.migrationsDir,
+        extensionsDir: input.extensionsDir,
+        includeExtensions: input.includeExtensions,
         client: input.client,
         opts: input.opts,
       })),

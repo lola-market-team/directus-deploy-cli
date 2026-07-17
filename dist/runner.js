@@ -32,6 +32,8 @@ export async function run(input) {
     if (input.entities.has("migrations") && input.migrationsDir) {
         results.push(...(await reconcileMigrations({
             migrationsDir: input.migrationsDir,
+            extensionsDir: input.extensionsDir,
+            includeExtensions: input.includeExtensions,
             client: input.client,
             opts: input.opts,
         })));

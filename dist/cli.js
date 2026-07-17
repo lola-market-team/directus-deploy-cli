@@ -1,8 +1,85 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { readFileSync, existsSync } from "node:fs";
 import { run } from "./runner.js";
 import { formatHuman, formatJson } from "./report.js";
 import { createDirectusClient } from "./http.js";
+// Auto-load .env from cwd so `npx directus-deploy diff --target test` works
+// without asking every user to remember `set -a; source .env; set +a`.
+// Never overrides existing process.env — shell always wins.
+function loadDotenv(path) {
+    if (!existsSync(path))
+        return;
+    const raw = readFileSync(path, "utf8");
+    for (const line of raw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith("#"))
+            continue;
+        const eq = trimmed.indexOf("=");
+        if (eq < 1)
+            continue;
+        const key = trimmed.slice(0, eq).trim();
+        if (process.env[key] !== undefined)
+            continue;
+        let val = trimmed.slice(eq + 1).trim();
+        if ((val.startsWith('"') && val.endsWith('"')) ||
+            (val.startsWith("'") && val.endsWith("'"))) {
+            val = val.slice(1, -1);
+        }
+        process.env[key] = val;
+    }
+}
+loadDotenv(".env");
+// Resolve a named target (e.g. "test", "staging", "prod") from
+// directus-deploy.targets.json into { url, token }. Returns null if the name
+// doesn't match an entry — callers then fall through to --url/--token.
+//
+// Token env var:
+//   - explicit per-target `token_env` field, else
+//   - DIRECTUS_<UPPER>_TOKEN convention (e.g. DIRECTUS_TEST_TOKEN)
+function resolveTargetCredentials(name, targetsFile) {
+    if (!name)
+        return null;
+    if (!existsSync(targetsFile))
+        return null;
+    let parsed;
+    try {
+        parsed = JSON.parse(readFileSync(targetsFile, "utf8"));
+    }
+    catch {
+        return null;
+    }
+    const entry = parsed.targets?.[name];
+    if (!entry?.base_url)
+        return null;
+    const tokenEnv = entry.token_env ?? `DIRECTUS_${name.toUpperCase()}_TOKEN`;
+    const token = process.env[tokenEnv];
+    if (!token) {
+        throw new Error(`target '${name}' resolved from ${targetsFile}, but ${tokenEnv} is not set in env`);
+    }
+    return { url: entry.base_url, token, label: name };
+}
+function resolveConnection(opts) {
+    let url = opts.url ?? process.env.DIRECTUS_URL;
+    let token = opts.token ?? process.env.DIRECTUS_TOKEN;
+    let label = opts.target;
+    const targetsFile = opts.targetsFile ?? "./directus-deploy.targets.json";
+    if (!url || !token) {
+        const r = resolveTargetCredentials(opts.target, targetsFile);
+        if (r) {
+            url = url ?? r.url;
+            token = token ?? r.token;
+            label = label ?? r.label;
+        }
+    }
+    if (!url) {
+        throw new Error("--url or DIRECTUS_URL required (or --target <name> matching targets file)");
+    }
+    if (!token) {
+        throw new Error("--token or DIRECTUS_TOKEN required (or --target <name> matching targets file)");
+    }
+    return { url, token, target: label ?? new URL(url).hostname };
+}
 const KNOWN_ENTITIES = [
     "collections",
     "fields",
@@ -30,13 +107,7 @@ function parseEntities(csv) {
     return set;
 }
 function readCommon(flags) {
-    const url = flags.url ?? process.env.DIRECTUS_URL;
-    const token = flags.token ?? process.env.DIRECTUS_TOKEN;
-    if (!url)
-        throw new Error("--url or DIRECTUS_URL required");
-    if (!token)
-        throw new Error("--token or DIRECTUS_TOKEN required");
-    const target = flags.target ?? new URL(url).hostname;
+    const { url, token, target } = resolveConnection(flags);
     const entities = parseEntities(flags.entities);
     const onlyCollections = flags.onlyCollections
         ? new Set(flags.onlyCollections.split(",").map((s) => s.trim()).filter(Boolean))
@@ -51,6 +122,8 @@ function readCommon(flags) {
         configDir: flags.configDir,
         registerDir: flags.registerDir,
         migrationsDir: flags.migrationsDir,
+        extensionsDir: flags.extensionsDir,
+        includeExtensions: flags.includeExtensions,
         seedDir: flags.seedDir,
         json: Boolean(flags.json),
     };
@@ -67,6 +140,8 @@ async function execute(mode, flags) {
             registerDir: common.registerDir,
         },
         migrationsDir: common.migrationsDir,
+        extensionsDir: common.extensionsDir,
+        includeExtensions: common.includeExtensions,
         seedDir: common.seedDir,
         client,
         opts,
@@ -136,7 +211,8 @@ function attachCommon(cmd) {
     return cmd
         .option("--url <url>", "Directus base URL (env: DIRECTUS_URL)")
         .option("--token <token>", "Directus admin token (env: DIRECTUS_TOKEN)")
-        .option("--target <label>", "friendly label for logs (default: URL hostname)")
+        .option("--target <name>", "target name — resolved from targets file (base_url + DIRECTUS_<UPPER>_TOKEN); also used as log label")
+        .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
         .option("--entities <csv>", `comma-separated subset of ${KNOWN_ENTITIES.join(",")}`, KNOWN_ENTITIES.join(","))
         .option("--only-collections <csv>", "restrict run to these collection names")
         .option("--snapshot-dir <path>", "path to directus_config/snapshot", "./directus_config/snapshot")
@@ -144,6 +220,9 @@ function attachCommon(cmd) {
         .option("--register-dir <path>", "path to migrations/register", "./migrations/register")
         .option("--seed-dir <path>", "path to directus_config/seed (Tractr-style {collection, meta, data} files)", "./directus_config/seed")
         .option("--migrations-dir <path>", "path to migrations/*.sql (raw SQL, tracked in _directus_deploy_migrations)", "./migrations")
+        .option("--extensions-dir <path>", "root scanned for <name>/migrations/*.sql when --include-extensions", "./extensions")
+        .option("--include-extensions", "also scan extensions/*/migrations/*.sql (tracker keys: ext/<name>/<file>)", true)
+        .option("--no-include-extensions", "skip extensions/*/migrations/*.sql (root only)")
         .option("--json", "emit JSON report instead of human-readable");
 }
 attachCommon(program.command("plan"))
@@ -161,6 +240,194 @@ attachCommon(program.command("verify"))
     .action(async (_, cmd) => {
     process.exit(await execute({ dryRun: true, strict: true }, cmd.optsWithGlobals()));
 });
+// Unified diff: orchestrates migrations status + extensions diff + config
+// dry-run against a single target. Exits non-zero on any drift.
+program
+    .command("diff")
+    .description("Full drift check for a target: migrations, extensions, and config. Exit 1 on any drift, exit 2 if target unreachable.")
+    .option("--url <url>", "Directus base URL (env: DIRECTUS_URL)")
+    .option("--token <token>", "Directus admin token (env: DIRECTUS_TOKEN)")
+    .option("--target <name>", "target name — resolved from targets file (base_url + DIRECTUS_<UPPER>_TOKEN)")
+    .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
+    .option("--reference <ref>", "git ref to diff extensions against", "origin/develop")
+    .option("--snapshot-dir <path>", "path to directus_config/snapshot", "./directus_config/snapshot")
+    .option("--config-dir <path>", "path to directus_config/collections", "./directus_config/collections")
+    .option("--register-dir <path>", "path to migrations/register", "./migrations/register")
+    .option("--seed-dir <path>", "path to directus_config/seed", "./directus_config/seed")
+    .option("--migrations-dir <path>", "path to migrations/*.sql", "./migrations")
+    .option("--extensions-dir <path>", "root scanned for <name>/migrations/*.sql", "./extensions")
+    .option("--include-extensions", "also scan extensions/*/migrations/*.sql", true)
+    .option("--no-include-extensions", "skip extensions/*/migrations/*.sql (root only)")
+    .option("--json", "emit JSON summary")
+    .action(async (opts) => {
+    if (!opts.target) {
+        throw new Error("--target <name> required for diff (used to look up base_url + token)");
+    }
+    const { url, token, target } = resolveConnection(opts);
+    const client = createDirectusClient({ baseUrl: url, token });
+    // 1) Migrations
+    const { reconcileMigrations } = await import("./reconcilers/migrations.js");
+    const migResults = await reconcileMigrations({
+        migrationsDir: opts.migrationsDir,
+        extensionsDir: opts.extensionsDir,
+        includeExtensions: opts.includeExtensions,
+        client,
+        opts: { dryRun: true },
+    });
+    const migUnreachable = migResults.length === 1 && migResults[0]?.label === "migrations";
+    let migApplied = 0, migPending = 0, migMutated = 0;
+    const migPendingList = [];
+    const migMutatedList = [];
+    if (!migUnreachable) {
+        for (const r of migResults) {
+            const f = r.label.replace(/^migrations\//, "");
+            if (r.action === "unchanged")
+                migApplied++;
+            else if (r.action === "created") {
+                migPending++;
+                migPendingList.push(f);
+            }
+            else if (r.action === "failed") {
+                migMutated++;
+                migMutatedList.push(f);
+            }
+        }
+    }
+    // 2) Extensions
+    const { diffExtensions } = await import("./extensions.js");
+    const extReport = await diffExtensions({
+        targetsFile: opts.targetsFile,
+        targets: [target],
+        repoRoot: process.cwd(),
+        reference: opts.reference,
+    });
+    let extMatch = 0, extDrift = 0, extMissing = 0;
+    const extDriftList = [];
+    const extMissingList = [];
+    for (const row of extReport.rows) {
+        const cell = row.cells[target];
+        if (!cell)
+            continue;
+        if (cell.error) {
+            extMissing++;
+            extMissingList.push(row.extension);
+        }
+        else if (cell.matchesReference) {
+            extMatch++;
+        }
+        else {
+            extDrift++;
+            extDriftList.push({ name: row.extension, hint: cell.branchHint });
+        }
+    }
+    // 3) Config
+    const cfgReport = await run({
+        target,
+        paths: {
+            snapshotDir: opts.snapshotDir,
+            configDir: opts.configDir,
+            registerDir: opts.registerDir,
+        },
+        migrationsDir: opts.migrationsDir,
+        extensionsDir: opts.extensionsDir,
+        includeExtensions: opts.includeExtensions,
+        seedDir: opts.seedDir,
+        client,
+        opts: { dryRun: true },
+        entities: new Set([
+            "collections",
+            "fields",
+            "relations",
+            "roles",
+            "policies",
+            "permissions",
+            "flows",
+            "operations",
+            "seeds",
+        ]),
+    });
+    const cfgByKind = {};
+    const cfgChangeList = [];
+    for (const r of cfgReport.results) {
+        if (r.kind === "migrations")
+            continue;
+        if (!cfgByKind[r.kind])
+            cfgByKind[r.kind] = { created: 0, updated: 0 };
+        if (r.action === "created") {
+            cfgByKind[r.kind].created++;
+            cfgChangeList.push(`+ ${r.label}`);
+        }
+        else if (r.action === "updated") {
+            cfgByKind[r.kind].updated++;
+            cfgChangeList.push(`~ ${r.label}`);
+        }
+    }
+    const cfgChangeCount = Object.values(cfgByKind).reduce((s, v) => s + v.created + v.updated, 0);
+    const summary = {
+        target,
+        migrations: migUnreachable
+            ? { unreachable: true }
+            : { applied: migApplied, pending: migPending, mutated: migMutated, pendingList: migPendingList, mutatedList: migMutatedList },
+        extensions: {
+            reference: opts.reference,
+            match: extMatch,
+            drift: extDrift,
+            missing: extMissing,
+            driftList: extDriftList,
+            missingList: extMissingList,
+        },
+        config: {
+            totalChanges: cfgChangeCount,
+            byKind: cfgByKind,
+            changeList: cfgChangeList,
+        },
+    };
+    if (opts.json) {
+        process.stdout.write(JSON.stringify(summary, null, 2) + "\n");
+    }
+    else {
+        const lines = [];
+        lines.push(`diff: ${target}`);
+        lines.push("");
+        // migrations
+        if (migUnreachable) {
+            lines.push("migrations   ⚠ target unreachable (raw-query endpoint missing)");
+        }
+        else {
+            const mstat = migPending === 0 && migMutated === 0 ? "✓" : "✗";
+            lines.push(`migrations   ${migApplied} applied · ${migPending} pending · ${migMutated} mutated                 ${mstat}`);
+            for (const f of migPendingList)
+                lines.push(`             [ ] ${f}`);
+            for (const f of migMutatedList)
+                lines.push(`             [!] ${f}`);
+        }
+        // extensions
+        const estat = extDrift === 0 ? "✓" : "✗";
+        lines.push(`extensions   ${extMatch} match · ${extDrift} drift · ${extMissing} unreachable (vs ${opts.reference})   ${estat}`);
+        for (const { name, hint } of extDriftList)
+            lines.push(`             ✗ ${name}${hint ? `  — running ${hint}` : ""}`);
+        for (const name of extMissingList)
+            lines.push(`             ? ${name}  — /_meta unreachable (hook-only bundle?)`);
+        // config
+        const cstat = cfgChangeCount === 0 ? "✓" : "✗";
+        const byKindStr = Object.entries(cfgByKind)
+            .filter(([, v]) => v.created + v.updated > 0)
+            .map(([k, v]) => `${k} ${v.created + v.updated}`)
+            .join(" · ") || "no changes";
+        lines.push(`config       ${byKindStr}                                     ${cstat}`);
+        for (const c of cfgChangeList)
+            lines.push(`             ${c}`);
+        lines.push("");
+        const drift = migPending + migMutated + extDrift + cfgChangeCount;
+        lines.push(drift === 0 ? "In sync." : `Drift detected (${drift} item(s)).`);
+        process.stdout.write(lines.join("\n") + "\n");
+    }
+    if (migUnreachable)
+        process.exit(2);
+    if (migPending + migMutated + extDrift + cfgChangeCount > 0)
+        process.exit(1);
+    process.exit(0);
+});
 // migrations adopt: bootstrap the tracker on an env whose migrations were
 // applied via some prior mechanism. Inserts (filename, sha256) rows without
 // executing any SQL. Idempotent — re-adopting is a no-op when hashes match.
@@ -172,22 +439,22 @@ migrationsGroup
     .description("Insert current migrations/*.sql into the tracker WITHOUT running them. Use once per env when cutting over from a prior deploy mechanism.")
     .option("--url <url>", "Directus base URL (env: DIRECTUS_URL)")
     .option("--token <token>", "Directus admin token (env: DIRECTUS_TOKEN)")
-    .option("--target <label>", "friendly label for logs (default: URL hostname)")
+    .option("--target <name>", "target name — resolved from targets file (base_url + DIRECTUS_<UPPER>_TOKEN)")
+    .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
     .option("--migrations-dir <path>", "path to migrations/*.sql", "./migrations")
+    .option("--extensions-dir <path>", "root scanned for <name>/migrations/*.sql when --include-extensions", "./extensions")
+    .option("--include-extensions", "also scan extensions/*/migrations/*.sql (tracker keys: ext/<name>/<file>)", true)
+    .option("--no-include-extensions", "skip extensions/*/migrations/*.sql (root only)")
     .option("--dry-run", "report what would be adopted, don't write")
     .option("--json", "emit JSON report instead of human-readable")
     .action(async (opts) => {
-    const url = opts.url ?? process.env.DIRECTUS_URL;
-    const token = opts.token ?? process.env.DIRECTUS_TOKEN;
-    if (!url)
-        throw new Error("--url or DIRECTUS_URL required");
-    if (!token)
-        throw new Error("--token or DIRECTUS_TOKEN required");
-    const target = opts.target ?? new URL(url).hostname;
+    const { url, token, target } = resolveConnection(opts);
     const client = createDirectusClient({ baseUrl: url, token });
     const { adoptMigrations } = await import("./reconcilers/migrations.js");
     const results = await adoptMigrations({
         migrationsDir: opts.migrationsDir,
+        extensionsDir: opts.extensionsDir,
+        includeExtensions: opts.includeExtensions,
         client,
         opts: { dryRun: Boolean(opts.dryRun) },
     });
@@ -202,6 +469,81 @@ migrationsGroup
         process.stdout.write(formatHuman(report) + "\n");
     }
     process.exit(counts.failed > 0 ? 1 : 0);
+});
+migrationsGroup
+    .command("status")
+    .description("Report which migrations/*.sql are applied on the target vs pending. Exit 1 if any pending or mutated files. Exit 2 if target unreachable.")
+    .option("--url <url>", "Directus base URL (env: DIRECTUS_URL)")
+    .option("--token <token>", "Directus admin token (env: DIRECTUS_TOKEN)")
+    .option("--target <name>", "target name — resolved from targets file (base_url + DIRECTUS_<UPPER>_TOKEN)")
+    .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
+    .option("--migrations-dir <path>", "path to migrations/*.sql", "./migrations")
+    .option("--extensions-dir <path>", "root scanned for <name>/migrations/*.sql when --include-extensions", "./extensions")
+    .option("--include-extensions", "also scan extensions/*/migrations/*.sql (tracker keys: ext/<name>/<file>)", true)
+    .option("--no-include-extensions", "skip extensions/*/migrations/*.sql (root only)")
+    .option("--json", "emit JSON output instead of human-readable")
+    .action(async (opts) => {
+    const { url, token, target } = resolveConnection(opts);
+    const client = createDirectusClient({ baseUrl: url, token });
+    const { reconcileMigrations } = await import("./reconcilers/migrations.js");
+    const results = await reconcileMigrations({
+        migrationsDir: opts.migrationsDir,
+        extensionsDir: opts.extensionsDir,
+        includeExtensions: opts.includeExtensions,
+        client,
+        opts: { dryRun: true },
+    });
+    // Detect unreachable target: reconciler emits a single skipped result
+    // with label "migrations" (not "migrations/<file>") when /raw-query/execute
+    // is missing.
+    const unreachable = results.length === 1 && results[0]?.label === "migrations";
+    if (unreachable) {
+        const reason = results[0]?.reason ?? "target unreachable";
+        if (opts.json) {
+            process.stdout.write(JSON.stringify({ target, unreachable: true, reason }, null, 2) + "\n");
+        }
+        else {
+            process.stderr.write(`migrations status: ${target}: ${reason}\n`);
+        }
+        process.exit(2);
+    }
+    const applied = [];
+    const pending = [];
+    const mutated = [];
+    const empty = [];
+    for (const r of results) {
+        const file = r.label.replace(/^migrations\//, "");
+        if (r.action === "unchanged")
+            applied.push(file);
+        else if (r.action === "created")
+            pending.push(file);
+        else if (r.action === "failed")
+            mutated.push({ file, reason: r.reason ?? "unknown" });
+        else if (r.action === "skipped")
+            empty.push(file);
+    }
+    if (opts.json) {
+        process.stdout.write(JSON.stringify({ target, applied, pending, mutated, empty }, null, 2) + "\n");
+    }
+    else {
+        const out = [];
+        out.push(`migrations status: ${target}`);
+        out.push("");
+        const all = [...applied.map((f) => ({ f, mark: "[X]" })), ...pending.map((f) => ({ f, mark: "[ ]" }))];
+        all.sort((a, b) => a.f.localeCompare(b.f));
+        for (const { f, mark } of all)
+            out.push(`  ${mark} ${f}`);
+        for (const m of mutated)
+            out.push(`  [!] ${m.file}  — ${m.reason}`);
+        out.push("");
+        out.push(`Applied: ${applied.length}   Pending: ${pending.length}   Mutated: ${mutated.length}`);
+        if (empty.length > 0)
+            out.push(`(${empty.length} empty file(s) skipped)`);
+        process.stdout.write(out.join("\n") + "\n");
+    }
+    if (mutated.length > 0 || pending.length > 0)
+        process.exit(1);
+    process.exit(0);
 });
 migrationsGroup
     .command("lint")
@@ -330,8 +672,11 @@ extensionsGroup
     .option("--repo-root <path>", "repo root (default: cwd)", process.cwd())
     .option("--all", "push every extension (respects --targets-file)")
     .option("--skip-build", "skip 'npm run build' — assume dist/ is up to date")
+    .option("--publish", "also publish an immutable artifact to gs://<artifact_bucket>/<name>/<sha>.tgz (build-once/promote-many)")
+    .option("--allow-dirty", "permit publish from a dirty worktree (artifact won't be reproducible; never for prod)")
+    .option("--force", "overwrite an existing artifact (breaks first-write-wins byte-identity — use with care)")
     .action(async (names, opts) => {
-    const { pushExtension } = await import("./extensions.js");
+    const { pushExtension, shaMatch } = await import("./extensions.js");
     let list = names;
     if ((!list || list.length === 0) && opts.all) {
         const { readdir } = await import("node:fs/promises");
@@ -354,14 +699,20 @@ extensionsGroup
                 targetsFile: opts.targetsFile,
                 repoRoot: opts.repoRoot,
                 skipBuild: Boolean(opts.skipBuild),
+                publish: Boolean(opts.publish),
+                allowDirty: Boolean(opts.allowDirty),
+                force: Boolean(opts.force),
             });
             const verify = r.verifiedCommit
-                ? r.verifiedCommit.startsWith(r.sourceCommit)
+                ? shaMatch(r.verifiedCommit, r.sourceCommit)
                     ? "✓ verified"
                     : `✗ /_meta reports ${r.verifiedCommit.slice(0, 8)}, expected ${r.sourceCommit.slice(0, 8)}`
                 : "⚠ /_meta not readable — verify manually";
-            process.stdout.write(`    build=${r.buildDurationMs}ms rsync=${r.transportDurationMs}ms commit=${r.sourceCommit.slice(0, 8)} ${verify}\n`);
-            if (r.verifiedCommit && !r.verifiedCommit.startsWith(r.sourceCommit))
+            const pub = r.artifact
+                ? ` published=${r.artifact.alreadyPublished ? "reused" : "new"} sha=${r.artifact.sha256.slice(0, 12)}`
+                : "";
+            process.stdout.write(`    build=${r.buildDurationMs}ms rsync=${r.transportDurationMs}ms commit=${r.sourceCommit.slice(0, 8)}${pub} ${verify}\n`);
+            if (r.verifiedCommit && !shaMatch(r.verifiedCommit, r.sourceCommit))
                 anyFailed = true;
         }
         catch (e) {
@@ -425,6 +776,60 @@ extensionsGroup
     }
     const drift = report.rows.some((r) => Object.values(r.cells).some((c) => c.sourceCommit && !c.matchesReference));
     process.exit(drift ? 1 : 0);
+});
+extensionsGroup
+    .command("promote")
+    .description("Promote a pre-published artifact from gs://<artifact_bucket>/<name>/<sha>.tgz to the target VM. Never builds — the artifact for the current source commit MUST already exist (publish first via `push --publish` on a lower env). Byte-identical to what ran on that lower env.")
+    .argument("[names...]", "extensions to promote (default: --all)")
+    .requiredOption("--target <env>", "target env name from the targets file (e.g. prod)")
+    .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
+    .option("--repo-root <path>", "repo root (default: cwd)", process.cwd())
+    .option("--all", "promote every extension under ./extensions")
+    .option("--source-commit <sha>", "override the resolved short-sha (promote a specific historical artifact)")
+    .action(async (names, opts) => {
+    const { promoteExtension, shaMatch } = await import("./extensions.js");
+    let list = names;
+    if ((!list || list.length === 0) && opts.all) {
+        const { readdir } = await import("node:fs/promises");
+        const { existsSync } = await import("node:fs");
+        const { join } = await import("node:path");
+        const entries = await readdir(join(opts.repoRoot, "extensions"));
+        list = entries.filter((e) => existsSync(join(opts.repoRoot, "extensions", e, "package.json"))).sort();
+    }
+    if (!list || list.length === 0) {
+        process.stderr.write("no extensions to promote. Pass names or --all.\n");
+        process.exit(2);
+    }
+    if (opts.sourceCommit && list.length !== 1) {
+        process.stderr.write("--source-commit only makes sense with a single extension.\n");
+        process.exit(2);
+    }
+    let anyFailed = false;
+    for (const name of list) {
+        try {
+            process.stdout.write(`==> promote ${name} → ${opts.target}\n`);
+            const r = await promoteExtension({
+                extensionName: name,
+                target: opts.target,
+                targetsFile: opts.targetsFile,
+                repoRoot: opts.repoRoot,
+                sourceCommit: opts.sourceCommit,
+            });
+            const verify = r.verifiedCommit
+                ? shaMatch(r.verifiedCommit, r.sourceCommit)
+                    ? "✓ verified"
+                    : `✗ /_meta reports ${r.verifiedCommit.slice(0, 8)}, expected ${r.sourceCommit.slice(0, 8)}`
+                : "⚠ /_meta not readable — verify manually";
+            process.stdout.write(`    artifact=${r.artifactUri} transport=${r.transportDurationMs}ms commit=${r.sourceCommit.slice(0, 8)} ${verify}\n`);
+            if (r.verifiedCommit && !shaMatch(r.verifiedCommit, r.sourceCommit))
+                anyFailed = true;
+        }
+        catch (e) {
+            anyFailed = true;
+            process.stderr.write(`    FAILED: ${e.message}\n`);
+        }
+    }
+    process.exit(anyFailed ? 1 : 0);
 });
 program.parseAsync(process.argv).catch((e) => {
     process.stderr.write(`directus-deploy: ${e.message}\n`);
