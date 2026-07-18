@@ -37,6 +37,21 @@ export async function reconcileCollections(input) {
         }
         const payload = sanitizeForWrite(desired);
         if (existing === null) {
+            // Inline the snapshot's fields so Directus creates the collection with
+            // its intended PK (and other schema-critical shape). Fields are
+            // sanitized (strips `id`/`_syncId`) and stripped of `collection` since
+            // that's implied by the parent. If no fields snapshot is available for
+            // this collection, we fall back to the plain payload — Directus will
+            // pick its default (integer auto-increment PK), and the fields
+            // reconciler will attempt to fill in the rest afterwards.
+            const snapshotFields = input.fieldsByCollection?.get(name);
+            if (snapshotFields && snapshotFields.length > 0) {
+                payload["fields"] = snapshotFields.map((f) => {
+                    const cleaned = sanitizeForWrite(f);
+                    delete cleaned["collection"];
+                    return cleaned;
+                });
+            }
             if (!input.opts.dryRun) {
                 try {
                     await input.client.post("/collections", payload);

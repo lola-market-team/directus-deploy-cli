@@ -85,6 +85,7 @@ export async function run(input: RunInput): Promise<RunReport> {
       ...(await reconcileCollections({
         collections: snapshot.collections,
         registerManifests: snapshot.registerManifests,
+        fieldsByCollection: snapshot.fieldsByCollection,
         client: input.client,
         opts: input.opts,
       })),

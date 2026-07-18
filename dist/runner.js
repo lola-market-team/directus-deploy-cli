@@ -54,6 +54,7 @@ export async function run(input) {
         results.push(...(await reconcileCollections({
             collections: snapshot.collections,
             registerManifests: snapshot.registerManifests,
+            fieldsByCollection: snapshot.fieldsByCollection,
             client: input.client,
             opts: input.opts,
         })));

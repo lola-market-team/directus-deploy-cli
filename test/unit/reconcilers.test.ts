@@ -63,6 +63,53 @@ describe("reconcileCollections", () => {
     expect(client.patch).toHaveBeenCalledWith("/collections/listings", { meta: { hidden: true } });
   });
 
+  it("inlines snapshot fields at CREATE so Directus provisions the intended PK", async () => {
+    const client = mockClient();
+    const fields = new Map<string, Record<string, unknown>[]>();
+    fields.set("sale_gift_transactions", [
+      {
+        collection: "sale_gift_transactions",
+        field: "id",
+        type: "uuid",
+        meta: { special: ["uuid"], hidden: true },
+        schema: { is_primary_key: true, has_auto_increment: false, default_value: "gen_random_uuid()" },
+      },
+      {
+        collection: "sale_gift_transactions",
+        field: "kind",
+        type: "string",
+        meta: { interface: "select-dropdown" },
+        schema: { is_nullable: false },
+      },
+    ]);
+    await reconcileCollections({
+      collections: [{ collection: "sale_gift_transactions", meta: { hidden: false } }],
+      registerManifests: new Set(),
+      fieldsByCollection: fields,
+      client,
+      opts: { dryRun: false },
+    });
+    const posted = (client.post as ReturnType<typeof vi.fn>).mock.calls[0]![1] as {
+      fields: Record<string, unknown>[];
+    };
+    expect(Array.isArray(posted.fields)).toBe(true);
+    expect(posted.fields).toHaveLength(2);
+    const idField = posted.fields.find((f) => (f as { field: string }).field === "id")!;
+    expect((idField as { type: string }).type).toBe("uuid");
+    expect((idField as { collection?: string }).collection).toBeUndefined();
+  });
+
+  it("falls back to bare payload when no fields snapshot is provided", async () => {
+    const client = mockClient();
+    await reconcileCollections({
+      collections: [{ collection: "listings", meta: { hidden: false } }],
+      registerManifests: new Set(),
+      client,
+      opts: { dryRun: false },
+    });
+    expect(client.post).toHaveBeenCalledWith("/collections", { collection: "listings", meta: { hidden: false } });
+  });
+
   it("only-collections filter", async () => {
     const client = mockClient();
     const results = await reconcileCollections({
