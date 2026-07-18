@@ -2,6 +2,25 @@ import type { ApplyOptions, DirectusClient, EntityResult } from "../types.js";
 import { diffSubset } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 
+const FK_SCHEMA_KEYS = new Set([
+  "foreign_key_column",
+  "foreign_key_schema",
+  "foreign_key_table",
+  "constraint_name",
+]);
+
+function stripFkKeys(
+  schema: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (!schema) return schema;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(schema)) {
+    if (FK_SCHEMA_KEYS.has(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
 export interface FieldReconcileInput {
   fieldsByCollection: Map<string, Record<string, unknown>[]>;
   registerManifests: Set<string>;
@@ -63,8 +82,12 @@ export async function reconcileFields(input: FieldReconcileInput): Promise<Entit
       // Only send schema when it *actually* differs. Re-asserting unchanged
       // schema on PK / sequence-backed columns makes Directus emit
       // ALTER COLUMN … DROP NOT NULL which Postgres rejects (verified today).
-      const desiredSchema = (payload.schema as Record<string, unknown> | undefined) ?? undefined;
-      const existingSchema = (existing?.schema as Record<string, unknown> | undefined) ?? {};
+      // FK-triplet keys (foreign_key_*, constraint_name) are owned by
+      // /relations, not /fields — PATCHing /fields with them is a no-op that
+      // still reports UPDATED, causing perpetual drift. Strip them so the
+      // fields diff ignores FK state entirely.
+      const desiredSchema = stripFkKeys(payload.schema as Record<string, unknown> | undefined);
+      const existingSchema = stripFkKeys(existing?.schema as Record<string, unknown> | undefined) ?? {};
 
       const desiredShape: Record<string, unknown> = {
         type: payload.type,

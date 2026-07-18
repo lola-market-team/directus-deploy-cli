@@ -1,5 +1,22 @@
 import { diffSubset } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
+const FK_SCHEMA_KEYS = new Set([
+    "foreign_key_column",
+    "foreign_key_schema",
+    "foreign_key_table",
+    "constraint_name",
+]);
+function stripFkKeys(schema) {
+    if (!schema)
+        return schema;
+    const out = {};
+    for (const [k, v] of Object.entries(schema)) {
+        if (FK_SCHEMA_KEYS.has(k))
+            continue;
+        out[k] = v;
+    }
+    return out;
+}
 export async function reconcileFields(input) {
     const results = [];
     for (const [collection, fields] of input.fieldsByCollection) {
@@ -49,8 +66,12 @@ export async function reconcileFields(input) {
             // Only send schema when it *actually* differs. Re-asserting unchanged
             // schema on PK / sequence-backed columns makes Directus emit
             // ALTER COLUMN … DROP NOT NULL which Postgres rejects (verified today).
-            const desiredSchema = payload.schema ?? undefined;
-            const existingSchema = existing?.schema ?? {};
+            // FK-triplet keys (foreign_key_*, constraint_name) are owned by
+            // /relations, not /fields — PATCHing /fields with them is a no-op that
+            // still reports UPDATED, causing perpetual drift. Strip them so the
+            // fields diff ignores FK state entirely.
+            const desiredSchema = stripFkKeys(payload.schema);
+            const existingSchema = stripFkKeys(existing?.schema) ?? {};
             const desiredShape = {
                 type: payload.type,
                 meta: desiredMeta,

@@ -27,6 +27,7 @@ export interface DirectusClient {
   get(path: string): Promise<Record<string, unknown> | Record<string, unknown>[] | null>;
   post(path: string, body: unknown): Promise<Record<string, unknown>>;
   patch(path: string, body: unknown): Promise<Record<string, unknown>>;
+  delete(path: string): Promise<void>;
   // Non-standard endpoints (/raw-query/execute, extension routes) return
   // their payload at the response root, not under `.data`. `postRaw` returns
   // the full parsed body untouched.
