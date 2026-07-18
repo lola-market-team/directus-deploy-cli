@@ -74,6 +74,7 @@ function makeMockClient(opts: { probeAvailable?: boolean; preSeed?: Map<string, 
     get: vi.fn(async () => null),
     post: vi.fn(async () => ({})),
     patch: vi.fn(async () => ({})),
+    delete: vi.fn(async () => undefined),
     postRaw,
   };
 

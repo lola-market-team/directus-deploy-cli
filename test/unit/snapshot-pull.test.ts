@@ -30,6 +30,7 @@ function mkClient(routes: Record<string, unknown>): DirectusClient {
     }),
     post: vi.fn(async () => ({})),
     patch: vi.fn(async () => ({})),
+    delete: vi.fn(async () => undefined),
     postRaw: vi.fn(async () => ({})),
   };
 }

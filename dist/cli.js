@@ -232,8 +232,18 @@ attachCommon(program.command("plan"))
 });
 attachCommon(program.command("apply"))
     .description("Apply the desired state to the target env.")
+    .option("--no-verify", "skip the post-apply verify pass (default: run verify after apply, exit non-zero on residual drift)")
     .action(async (_, cmd) => {
-    process.exit(await execute({ dryRun: false }, cmd.optsWithGlobals()));
+    const flags = cmd.optsWithGlobals();
+    const applyExit = await execute({ dryRun: false }, flags);
+    if (applyExit !== 0)
+        process.exit(applyExit);
+    // commander's --no-<flag> sets `verify: false`; default (`verify` absent
+    // or true) means run the post-apply verify.
+    if (flags.verify === false)
+        process.exit(0);
+    process.stdout.write("\n--- post-apply verify ---\n");
+    process.exit(await execute({ dryRun: true, strict: true }, flags));
 });
 attachCommon(program.command("verify"))
     .description("Post-apply drift check. Runs plan-mode and exits non-zero if any entity would be created or updated (idempotency guard for CI).")

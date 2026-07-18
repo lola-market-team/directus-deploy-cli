@@ -99,6 +99,13 @@ export function createDirectusClient(cfg) {
             const j = await readJson(r);
             return j.data ?? {};
         },
+        async delete(path) {
+            const r = await fetchWithRetry(base + path, { method: "DELETE", headers });
+            if (r.status === 404)
+                return; // idempotent
+            if (!r.ok)
+                throw toErr(r.url, r.status, await r.text());
+        },
         async postRaw(path, body) {
             const r = await fetchWithRetry(base + path, {
                 method: "POST",

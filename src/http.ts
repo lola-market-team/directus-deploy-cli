@@ -112,6 +112,11 @@ export function createDirectusClient(cfg: DirectusHttpConfig): DirectusClient {
       const j = await readJson(r);
       return ((j as { data?: unknown }).data as Record<string, unknown>) ?? {};
     },
+    async delete(path) {
+      const r = await fetchWithRetry(base + path, { method: "DELETE", headers });
+      if (r.status === 404) return; // idempotent
+      if (!r.ok) throw toErr(r.url, r.status, await r.text());
+    },
     async postRaw(path, body) {
       const r = await fetchWithRetry(base + path, {
         method: "POST",
