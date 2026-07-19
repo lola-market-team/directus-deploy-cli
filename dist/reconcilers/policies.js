@@ -1,4 +1,4 @@
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 import { resolveRoleSyncIdToServerId } from "../identity.js";
 async function listServerPolicies(client) {
@@ -83,7 +83,8 @@ export async function reconcilePolicies(input) {
         };
         const desiredCmp = stripRoles(payload);
         const existingCmp = stripRoles(existing);
-        if (diffSubset(desiredCmp, existingCmp)) {
+        const dp = diffSubset(desiredCmp, existingCmp);
+        if (dp) {
             const id = String(existing.id ?? "");
             if (!input.opts.dryRun) {
                 try {
@@ -94,7 +95,7 @@ export async function reconcilePolicies(input) {
                     continue;
                 }
             }
-            results.push({ kind: "policies", label, action: "updated" });
+            results.push({ kind: "policies", label, action: "updated", reason: formatDiffPath(dp) });
         }
         else {
             results.push({ kind: "policies", label, action: "unchanged" });

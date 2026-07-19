@@ -1,5 +1,5 @@
 import type { ApplyOptions, DirectusClient, EntityResult } from "../types.js";
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 import type { IdentityIndex } from "../identity.js";
 import { resolveOpSyncIdToServerId } from "../identity.js";
@@ -78,7 +78,8 @@ export async function reconcileFlowsPass1(
     // Skip `operation` in this pass — it's handled by Pass 2.
     const { operation: _do, ...desiredForDiff } = payload;
     const { operation: _eo, ...existingForDiff } = existingStripped;
-    if (diffSubset(desiredForDiff, existingForDiff)) {
+    const dp = diffSubset(desiredForDiff, existingForDiff);
+    if (dp) {
       const id = String((existing as { id?: unknown }).id ?? "");
       if (!input.opts.dryRun) {
         try {
@@ -88,7 +89,7 @@ export async function reconcileFlowsPass1(
           continue;
         }
       }
-      results.push({ kind: "flows", label, action: "updated" });
+      results.push({ kind: "flows", label, action: "updated", reason: formatDiffPath(dp) });
     } else {
       results.push({ kind: "flows", label, action: "unchanged" });
     }

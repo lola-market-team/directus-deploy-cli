@@ -1,4 +1,4 @@
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 const FK_SCHEMA_KEYS = new Set([
     "foreign_key_column",
@@ -91,20 +91,28 @@ export async function reconcileFields(input) {
                 }
                 results.push({ kind: "fields", label, action: "created" });
             }
-            else if (diffSubset(desiredShape, existing)) {
-                if (!input.opts.dryRun) {
-                    try {
-                        await input.client.patch(`/fields/${collection}/${field}`, desiredShape);
-                    }
-                    catch (e) {
-                        results.push({ kind: "fields", label, action: "failed", reason: e.message });
-                        continue;
-                    }
-                }
-                results.push({ kind: "fields", label, action: "updated" });
-            }
             else {
-                results.push({ kind: "fields", label, action: "unchanged" });
+                const dp = diffSubset(desiredShape, existing);
+                if (dp) {
+                    if (!input.opts.dryRun) {
+                        try {
+                            await input.client.patch(`/fields/${collection}/${field}`, desiredShape);
+                        }
+                        catch (e) {
+                            results.push({ kind: "fields", label, action: "failed", reason: e.message });
+                            continue;
+                        }
+                    }
+                    results.push({
+                        kind: "fields",
+                        label,
+                        action: "updated",
+                        reason: formatDiffPath(dp),
+                    });
+                }
+                else {
+                    results.push({ kind: "fields", label, action: "unchanged" });
+                }
             }
         }
     }

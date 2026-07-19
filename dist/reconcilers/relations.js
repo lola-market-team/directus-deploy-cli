@@ -1,4 +1,4 @@
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 // Identifier whitelist for building raw ALTER TABLE ADD CONSTRAINT SQL. Every
 // value we splice in comes from a snapshot JSON file in-repo (never user
@@ -268,29 +268,37 @@ export async function reconcileRelations(input) {
                     reason: "FK constraint missing in Postgres — recreated via ALTER TABLE ADD CONSTRAINT",
                 });
             }
-            else if (diffSubset(desiredMeta, existingMeta)) {
-                if (!input.opts.dryRun) {
-                    try {
-                        // Adopt-schema-only-FK case: when existing.meta is null (relation
-                        // exists as a Postgres FK constraint but has no directus_relations
-                        // row), Directus's PATCH endpoint attempts to INSERT the row. It
-                        // needs the top-level `.collection`/`.field` in the body to derive
-                        // `directus_relations.many_collection`. Sending only `{meta: ...}`
-                        // hits NOT_NULL_VIOLATION on many_collection.
-                        const patchBody = existingMeta && Object.keys(existingMeta).length > 0
-                            ? { meta: desiredMeta }
-                            : payload;
-                        await input.client.patch(`/relations/${collection}/${field}`, patchBody);
-                    }
-                    catch (e) {
-                        results.push({ kind: "relations", label, action: "failed", reason: e.message });
-                        continue;
-                    }
-                }
-                results.push({ kind: "relations", label, action: "updated" });
-            }
             else {
-                results.push({ kind: "relations", label, action: "unchanged" });
+                const dp = diffSubset(desiredMeta, existingMeta);
+                if (dp) {
+                    if (!input.opts.dryRun) {
+                        try {
+                            // Adopt-schema-only-FK case: when existing.meta is null (relation
+                            // exists as a Postgres FK constraint but has no directus_relations
+                            // row), Directus's PATCH endpoint attempts to INSERT the row. It
+                            // needs the top-level `.collection`/`.field` in the body to derive
+                            // `directus_relations.many_collection`. Sending only `{meta: ...}`
+                            // hits NOT_NULL_VIOLATION on many_collection.
+                            const patchBody = existingMeta && Object.keys(existingMeta).length > 0
+                                ? { meta: desiredMeta }
+                                : payload;
+                            await input.client.patch(`/relations/${collection}/${field}`, patchBody);
+                        }
+                        catch (e) {
+                            results.push({ kind: "relations", label, action: "failed", reason: e.message });
+                            continue;
+                        }
+                    }
+                    results.push({
+                        kind: "relations",
+                        label,
+                        action: "updated",
+                        reason: `meta.${formatDiffPath(dp)}`,
+                    });
+                }
+                else {
+                    results.push({ kind: "relations", label, action: "unchanged" });
+                }
             }
         }
     }

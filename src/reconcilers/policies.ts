@@ -1,5 +1,5 @@
 import type { ApplyOptions, DirectusClient, EntityResult } from "../types.js";
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 import type { IdentityIndex } from "../identity.js";
 import { resolveRoleSyncIdToServerId } from "../identity.js";
@@ -101,7 +101,8 @@ export async function reconcilePolicies(input: PolicyReconcileInput): Promise<En
     const desiredCmp = stripRoles(payload);
     const existingCmp = stripRoles(existing);
 
-    if (diffSubset(desiredCmp, existingCmp)) {
+    const dp = diffSubset(desiredCmp, existingCmp);
+    if (dp) {
       const id = String((existing as { id?: unknown }).id ?? "");
       if (!input.opts.dryRun) {
         try {
@@ -111,7 +112,7 @@ export async function reconcilePolicies(input: PolicyReconcileInput): Promise<En
           continue;
         }
       }
-      results.push({ kind: "policies", label, action: "updated" });
+      results.push({ kind: "policies", label, action: "updated", reason: formatDiffPath(dp) });
     } else {
       results.push({ kind: "policies", label, action: "unchanged" });
     }

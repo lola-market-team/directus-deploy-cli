@@ -1,4 +1,4 @@
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 import { resolvePolicySyncIdToServerId } from "../identity.js";
 async function listServerPermissions(client) {
@@ -60,26 +60,34 @@ export async function reconcilePermissions(input) {
             }
             results.push({ kind: "permissions", label, action: "created" });
         }
-        else if (diffSubset(payload, existing)) {
-            const id = String(existing.id ?? "");
-            if (!input.opts.dryRun) {
-                try {
-                    await input.client.patch(`/permissions/${id}`, payload);
-                }
-                catch (e) {
-                    results.push({
-                        kind: "permissions",
-                        label,
-                        action: "failed",
-                        reason: e.message,
-                    });
-                    continue;
-                }
-            }
-            results.push({ kind: "permissions", label, action: "updated" });
-        }
         else {
-            results.push({ kind: "permissions", label, action: "unchanged" });
+            const dp = diffSubset(payload, existing);
+            if (dp) {
+                const id = String(existing.id ?? "");
+                if (!input.opts.dryRun) {
+                    try {
+                        await input.client.patch(`/permissions/${id}`, payload);
+                    }
+                    catch (e) {
+                        results.push({
+                            kind: "permissions",
+                            label,
+                            action: "failed",
+                            reason: e.message,
+                        });
+                        continue;
+                    }
+                }
+                results.push({
+                    kind: "permissions",
+                    label,
+                    action: "updated",
+                    reason: formatDiffPath(dp),
+                });
+            }
+            else {
+                results.push({ kind: "permissions", label, action: "unchanged" });
+            }
         }
     }
     return results;

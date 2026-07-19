@@ -1,5 +1,5 @@
 import type { ApplyOptions, DirectusClient, EntityResult } from "../types.js";
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 import type { IdentityIndex } from "../identity.js";
 import { resolvePolicySyncIdToServerId } from "../identity.js";
@@ -81,24 +81,32 @@ export async function reconcilePermissions(
         }
       }
       results.push({ kind: "permissions", label, action: "created" });
-    } else if (diffSubset(payload, existing)) {
-      const id = String((existing as { id?: unknown }).id ?? "");
-      if (!input.opts.dryRun) {
-        try {
-          await input.client.patch(`/permissions/${id}`, payload);
-        } catch (e) {
-          results.push({
-            kind: "permissions",
-            label,
-            action: "failed",
-            reason: (e as Error).message,
-          });
-          continue;
-        }
-      }
-      results.push({ kind: "permissions", label, action: "updated" });
     } else {
-      results.push({ kind: "permissions", label, action: "unchanged" });
+      const dp = diffSubset(payload, existing);
+      if (dp) {
+        const id = String((existing as { id?: unknown }).id ?? "");
+        if (!input.opts.dryRun) {
+          try {
+            await input.client.patch(`/permissions/${id}`, payload);
+          } catch (e) {
+            results.push({
+              kind: "permissions",
+              label,
+              action: "failed",
+              reason: (e as Error).message,
+            });
+            continue;
+          }
+        }
+        results.push({
+          kind: "permissions",
+          label,
+          action: "updated",
+          reason: formatDiffPath(dp),
+        });
+      } else {
+        results.push({ kind: "permissions", label, action: "unchanged" });
+      }
     }
   }
   return results;

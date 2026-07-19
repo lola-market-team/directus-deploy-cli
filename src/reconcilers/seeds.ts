@@ -1,7 +1,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ApplyOptions, DirectusClient, EntityResult } from "../types.js";
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 
 // Seed data reconciler for the LOLA convention (Tractr-style seed files under
 // directus_config/seed/*.json). Each file shape:
@@ -159,7 +159,8 @@ export async function reconcileSeeds(input: SeedReconcileInput): Promise<EntityR
         continue;
       }
 
-      if (diffSubset(payload, existing)) {
+      const dp = diffSubset(payload, existing);
+      if (dp) {
         if (!input.opts.dryRun) {
           try {
             await input.client.patch(`/items/${collection}/${encodeURIComponent(String(id))}`, payload);
@@ -173,7 +174,7 @@ export async function reconcileSeeds(input: SeedReconcileInput): Promise<EntityR
             continue;
           }
         }
-        results.push({ kind: "seeds", label, action: "updated" });
+        results.push({ kind: "seeds", label, action: "updated", reason: formatDiffPath(dp) });
       } else {
         results.push({ kind: "seeds", label, action: "unchanged" });
       }
