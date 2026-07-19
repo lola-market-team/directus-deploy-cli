@@ -163,7 +163,7 @@ describe("reconcileFields", () => {
         schema: { data_type: "text" },
       },
     ]);
-    await reconcileFields({
+    const results = await reconcileFields({
       fieldsByCollection: fields,
       registerManifests: new Set(),
       client,
@@ -175,6 +175,9 @@ describe("reconcileFields", () => {
     );
     const patched = (client.patch as ReturnType<typeof vi.fn>).mock.calls[0][1] as Record<string, unknown>;
     expect(patched.schema).toBeUndefined();
+    // #21: UPDATED lines carry the diverging property inline.
+    expect(results[0]!.action).toBe("updated");
+    expect(results[0]!.reason).toBe("meta.hidden: false → true");
   });
 
   it("includes schema on PATCH when schema differs", async () => {

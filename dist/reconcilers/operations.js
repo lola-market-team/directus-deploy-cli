@@ -1,4 +1,4 @@
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 import { resolveFlowSyncIdToServerId, resolveOpSyncIdToServerId, } from "../identity.js";
 async function listServerOps(client) {
@@ -68,7 +68,8 @@ export async function reconcileOperationsPass1(input) {
         // Skip resolve/reject in diff — Pass 2 handles those.
         const { resolve: _dr, reject: _dj, ...desiredForDiff } = payload;
         const { resolve: _er, reject: _ej, ...existingForDiff } = existing;
-        if (diffSubset(desiredForDiff, existingForDiff)) {
+        const dp = diffSubset(desiredForDiff, existingForDiff);
+        if (dp) {
             const id = String(existing.id ?? "");
             if (!input.opts.dryRun) {
                 try {
@@ -84,7 +85,12 @@ export async function reconcileOperationsPass1(input) {
                     continue;
                 }
             }
-            results.push({ kind: "operations", label, action: "updated" });
+            results.push({
+                kind: "operations",
+                label,
+                action: "updated",
+                reason: formatDiffPath(dp),
+            });
         }
         else {
             results.push({ kind: "operations", label, action: "unchanged" });

@@ -1,4 +1,4 @@
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 export async function reconcileCollections(input) {
     const results = [];
@@ -71,7 +71,8 @@ export async function reconcileCollections(input) {
         }
         const desiredMeta = payload.meta ?? {};
         const existingMeta = existing.meta ?? {};
-        if (diffSubset(desiredMeta, existingMeta)) {
+        const dp = diffSubset(desiredMeta, existingMeta);
+        if (dp) {
             if (!input.opts.dryRun) {
                 try {
                     await input.client.patch(`/collections/${name}`, { meta: desiredMeta });
@@ -86,7 +87,12 @@ export async function reconcileCollections(input) {
                     continue;
                 }
             }
-            results.push({ kind: "collections", label, action: "updated" });
+            results.push({
+                kind: "collections",
+                label,
+                action: "updated",
+                reason: `meta.${formatDiffPath(dp)}`,
+            });
         }
         else {
             results.push({ kind: "collections", label, action: "unchanged" });

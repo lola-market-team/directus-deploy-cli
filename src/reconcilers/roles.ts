@@ -1,5 +1,5 @@
 import type { ApplyOptions, DirectusClient, EntityResult } from "../types.js";
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 
 // Roles are identity-by-name. UUID PK server-side; we resolve by name so the
@@ -57,19 +57,22 @@ export async function reconcileRoles(input: RoleReconcileInput): Promise<EntityR
         }
       }
       results.push({ kind: "roles", label, action: "created" });
-    } else if (diffSubset(payload, existing)) {
-      const id = String((existing as { id?: unknown }).id ?? "");
-      if (!input.opts.dryRun) {
-        try {
-          await input.client.patch(`/roles/${id}`, payload);
-        } catch (e) {
-          results.push({ kind: "roles", label, action: "failed", reason: (e as Error).message });
-          continue;
-        }
-      }
-      results.push({ kind: "roles", label, action: "updated" });
     } else {
-      results.push({ kind: "roles", label, action: "unchanged" });
+      const dp = diffSubset(payload, existing);
+      if (dp) {
+        const id = String((existing as { id?: unknown }).id ?? "");
+        if (!input.opts.dryRun) {
+          try {
+            await input.client.patch(`/roles/${id}`, payload);
+          } catch (e) {
+            results.push({ kind: "roles", label, action: "failed", reason: (e as Error).message });
+            continue;
+          }
+        }
+        results.push({ kind: "roles", label, action: "updated", reason: formatDiffPath(dp) });
+      } else {
+        results.push({ kind: "roles", label, action: "unchanged" });
+      }
     }
   }
   return results;

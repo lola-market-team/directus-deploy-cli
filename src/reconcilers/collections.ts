@@ -1,5 +1,5 @@
 import type { ApplyOptions, DirectusClient, EntityResult } from "../types.js";
-import { diffSubset } from "../diff.js";
+import { diffSubset, formatDiffPath } from "../diff.js";
 import { sanitizeForWrite } from "../sanitize.js";
 
 export interface CollectionReconcileInput {
@@ -90,7 +90,8 @@ export async function reconcileCollections(
 
     const desiredMeta = (payload.meta as Record<string, unknown> | undefined) ?? {};
     const existingMeta = (existing.meta as Record<string, unknown> | undefined) ?? {};
-    if (diffSubset(desiredMeta, existingMeta)) {
+    const dp = diffSubset(desiredMeta, existingMeta);
+    if (dp) {
       if (!input.opts.dryRun) {
         try {
           await input.client.patch(`/collections/${name}`, { meta: desiredMeta });
@@ -104,7 +105,12 @@ export async function reconcileCollections(
           continue;
         }
       }
-      results.push({ kind: "collections", label, action: "updated" });
+      results.push({
+        kind: "collections",
+        label,
+        action: "updated",
+        reason: `meta.${formatDiffPath(dp)}`,
+      });
     } else {
       results.push({ kind: "collections", label, action: "unchanged" });
     }
