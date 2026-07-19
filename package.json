@@ -1,6 +1,6 @@
 {
   "name": "directus-deploy-cli",
-  "version": "0.13.3",
+  "version": "0.14.0",
   "description": "Per-entity, non-atomic Directus deployment tool. Reconciles collections/fields/relations/roles/policies/permissions/flows/operations/migrations/seeds from git to any environment.",
   "type": "module",
   "bin": {
