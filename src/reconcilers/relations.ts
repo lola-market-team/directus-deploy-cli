@@ -5,7 +5,8 @@ import { sanitizeForWrite } from "../sanitize.js";
 // Identifier whitelist for building raw ALTER TABLE ADD CONSTRAINT SQL. Every
 // value we splice in comes from a snapshot JSON file in-repo (never user
 // input), but constrain the shape to snake_case/alnum anyway so a typo can't
-// escape into unquoted SQL.
+// escape into unquoted SQL. Values also flow into a single-quoted SQL literal
+// inside loadFkConstraints — the same regex is the gate for both paths.
 const IDENT_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
 function assertIdent(name: string, kind: string): string {
@@ -15,21 +16,42 @@ function assertIdent(name: string, kind: string): string {
   return name;
 }
 
-// Query information_schema.table_constraints for every FK on the given tables.
-// Returns a Map<table, Set<constraint_name>>. Returns null if the target has
-// no /raw-query/execute endpoint — callers then skip FK repair (drift stays
-// invisible, same as before this fix). Batched so one RTT covers the whole
-// reconcile pass.
+interface PgFkRow {
+  referenced_table: string;
+  referenced_column: string;
+  constraint_name: string;
+}
+
+// Load every FK on the given tables, keyed by (table, column) — NOT by
+// constraint_name. Constraint names are cosmetic: a snapshot that pins
+// `<coll>_<field>_fkey` while Postgres has `<coll>_<field>_foreign` should
+// NOT report drift as long as the column-level FK relationship matches.
+// Returns null when /raw-query/execute is unavailable so callers can skip
+// FK checks gracefully. See issues #18, #19.
 async function loadFkConstraints(
   client: DirectusClient,
   tables: Iterable<string>,
-): Promise<Map<string, Set<string>> | null> {
+): Promise<Map<string, Map<string, PgFkRow>> | null> {
+  // Filter identifiers before we splice them into SQL literals below. The
+  // in-clause uses single-quoted strings; combined with IDENT_RE the values
+  // are safe. Same defense applies in buildAddConstraintSql.
   const list = [...new Set(tables)].filter((t) => IDENT_RE.test(t));
   if (list.length === 0) return new Map();
   const inClause = list.map((t) => `'${t}'`).join(",");
+  // information_schema join: table_constraints (kind), key_column_usage
+  // (child column), constraint_column_usage (parent table+column). Filter
+  // to public schema — non-public FKs aren't supported (#20).
   const query =
-    `SELECT table_name, constraint_name FROM information_schema.table_constraints ` +
-    `WHERE constraint_type = 'FOREIGN KEY' AND table_name IN (${inClause})`;
+    `SELECT tc.table_name, kcu.column_name, tc.constraint_name, ` +
+    `ccu.table_name AS referenced_table, ccu.column_name AS referenced_column ` +
+    `FROM information_schema.table_constraints tc ` +
+    `JOIN information_schema.key_column_usage kcu ` +
+    `ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema ` +
+    `JOIN information_schema.constraint_column_usage ccu ` +
+    `ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema ` +
+    `WHERE tc.constraint_type = 'FOREIGN KEY' ` +
+    `AND tc.table_schema = 'public' ` +
+    `AND tc.table_name IN (${inClause})`;
   try {
     const r = (await client.postRaw("/raw-query/execute", { query })) as {
       success?: boolean;
@@ -37,13 +59,19 @@ async function loadFkConstraints(
     };
     const inner = r?.results?.[0];
     if (!r?.success || !inner?.success) return null;
-    const out = new Map<string, Set<string>>();
+    const out = new Map<string, Map<string, PgFkRow>>();
     for (const row of inner.data ?? []) {
-      if (row && typeof row === "object" && "table_name" in row && "constraint_name" in row) {
-        const rr = row as { table_name: unknown; constraint_name: unknown };
-        const t = String(rr.table_name);
-        if (!out.has(t)) out.set(t, new Set());
-        out.get(t)!.add(String(rr.constraint_name));
+      if (row && typeof row === "object") {
+        const rr = row as Record<string, unknown>;
+        const table = String(rr.table_name ?? "");
+        const column = String(rr.column_name ?? "");
+        if (!table || !column) continue;
+        if (!out.has(table)) out.set(table, new Map());
+        out.get(table)!.set(column, {
+          referenced_table: String(rr.referenced_table ?? ""),
+          referenced_column: String(rr.referenced_column ?? ""),
+          constraint_name: String(rr.constraint_name ?? ""),
+        });
       }
     }
     return out;
@@ -90,6 +118,40 @@ function buildAddConstraintSql(input: FkRepairInputs): string {
   );
 }
 
+// Best-effort diagnostic on FK-repair failure. ALTER TABLE ADD CONSTRAINT
+// fails when child rows reference nonexistent parent rows — the actual
+// Postgres error text ("insert or update on table … violates foreign key
+// constraint") doesn't hint at *how many* orphans exist, which is the
+// difference between a five-minute fix (a handful) and a data-model
+// conversation (millions). See #22.
+async function summarizeOrphans(
+  client: DirectusClient,
+  collection: string,
+  field: string,
+  fkTable: string,
+  fkColumn: string,
+): Promise<string | null> {
+  if (!IDENT_RE.test(collection) || !IDENT_RE.test(field)) return null;
+  if (!IDENT_RE.test(fkTable) || !IDENT_RE.test(fkColumn)) return null;
+  const query =
+    `SELECT COUNT(*)::int AS n FROM "${collection}" c ` +
+    `LEFT JOIN "${fkTable}" p ON c."${field}" = p."${fkColumn}" ` +
+    `WHERE c."${field}" IS NOT NULL AND p."${fkColumn}" IS NULL`;
+  try {
+    const r = (await client.postRaw("/raw-query/execute", { query })) as {
+      success?: boolean;
+      results?: Array<{ success?: boolean; data?: Array<{ n?: number }> }>;
+    };
+    const inner = r?.results?.[0];
+    if (!r?.success || !inner?.success) return null;
+    const n = Number(inner.data?.[0]?.n ?? 0);
+    if (n <= 0) return null;
+    return ` — likely cause: ${n} orphan row(s) in ${collection}.${field} reference ${fkTable}.${fkColumn} that don't exist`;
+  } catch {
+    return null;
+  }
+}
+
 export interface RelationReconcileInput {
   relationsByCollection: Map<string, Record<string, unknown>[]>;
   client: DirectusClient;
@@ -100,6 +162,7 @@ export async function reconcileRelations(
   input: RelationReconcileInput,
 ): Promise<EntityResult[]> {
   const results: EntityResult[] = [];
+  const rejectedNonPublic: string[] = [];
 
   // Load pg_constraint FK state up front — needed for FK-drift detection
   // because Directus's GET /relations `.schema` block reads from a cached
@@ -107,14 +170,42 @@ export async function reconcileRelations(
   // information_schema.table_constraints is authoritative. (Empirically
   // verified against test.lola.market on 2026-07-18 for issue #16.)
   const tablesToQuery: string[] = [];
+  let expectedFkCount = 0;
   for (const [collection, relations] of input.relationsByCollection) {
     if (input.opts.onlyCollections && !input.opts.onlyCollections.has(collection)) continue;
-    const anyFkExpected = relations.some(
-      (r) => (r as { schema?: Record<string, unknown> }).schema?.foreign_key_table !== undefined,
-    );
-    if (anyFkExpected) tablesToQuery.push(collection);
+    for (const r of relations) {
+      const schema = (r as { schema?: Record<string, unknown> }).schema;
+      if (schema?.foreign_key_table === undefined) continue;
+      // #20: reject non-public schemas explicitly. Silent misbuild is worse
+      // than a loud skip.
+      const fkSchema = schema.foreign_key_schema;
+      if (fkSchema !== undefined && fkSchema !== null && String(fkSchema) !== "public") {
+        rejectedNonPublic.push(`${collection}.${String((r as { field?: unknown }).field)}`);
+        continue;
+      }
+      expectedFkCount++;
+      if (!tablesToQuery.includes(collection)) tablesToQuery.push(collection);
+    }
   }
   const pgFks = await loadFkConstraints(input.client, tablesToQuery);
+  // #19: warn once when the check was expected to run but /raw-query/execute
+  // is unavailable. Without this, silent-skip masks real drift on envs that
+  // lack the extension.
+  if (pgFks === null && expectedFkCount > 0) {
+    process.stderr.write(
+      `relations: could not query information_schema.table_constraints ` +
+        `(raw-query endpoint unavailable?) — FK drift check skipped for ` +
+        `${expectedFkCount} relation(s)\n`,
+    );
+  }
+  for (const label of rejectedNonPublic) {
+    results.push({
+      kind: "relations",
+      label: `relations/${label}`,
+      action: "skipped",
+      reason: "non-public foreign_key_schema not supported by FK reconciler",
+    });
+  }
 
   for (const [collection, relations] of input.relationsByCollection) {
     if (input.opts.onlyCollections && !input.opts.onlyCollections.has(collection)) continue;
@@ -122,6 +213,9 @@ export async function reconcileRelations(
       const field = String((desired as { field?: unknown }).field ?? "");
       if (!field) continue;
       const label = `relations/${collection}.${field}`;
+      // Skip anything we already rejected as non-public — the note is already
+      // in results and we don't want to double-count.
+      if (rejectedNonPublic.includes(`${collection}.${field}`)) continue;
 
       let existing: Record<string, unknown> | null;
       try {
@@ -137,16 +231,28 @@ export async function reconcileRelations(
       const existingMeta = (existing?.meta as Record<string, unknown> | undefined) ?? {};
       const desiredSchema = payload.schema as Record<string, unknown> | undefined;
 
-      // FK drift: the snapshot expects a FK, but pg_constraint doesn't have
-      // it. Only checked when we successfully loaded FK state (pgFks !== null)
-      // AND the snapshot pins a foreign_key_table for this field.
+      // #18: FK drift by COLUMN (not constraint_name). Snapshot says "FK on
+      // this column pointing to <table>.<column>"; pg either has that or
+      // doesn't. constraint_name is cosmetic — a matching FK under a legacy
+      // name is not drift.
       let fkDrift = false;
+      let fkDriftMismatch: string | undefined;
       if (existing !== null && pgFks && desiredSchema?.foreign_key_table) {
-        const expected = String(
-          desiredSchema.constraint_name ?? `${collection}_${field}_foreign`,
-        );
-        const actual = pgFks.get(collection);
-        fkDrift = !actual || !actual.has(expected);
+        const expectedTable = String(desiredSchema.foreign_key_table);
+        const expectedColumn = String(desiredSchema.foreign_key_column ?? "id");
+        const actual = pgFks.get(collection)?.get(field);
+        if (!actual) {
+          fkDrift = true;
+        } else if (
+          actual.referenced_table !== expectedTable ||
+          actual.referenced_column !== expectedColumn
+        ) {
+          // Rare: FK exists on this column but points at the wrong target.
+          // Don't try to auto-repair — a DROP + ADD could break referential
+          // guarantees. Fail loudly and let a human decide.
+          fkDrift = false;
+          fkDriftMismatch = `FK on ${collection}.${field} points to ${actual.referenced_table}.${actual.referenced_column} (snapshot expects ${expectedTable}.${expectedColumn}) — manual DROP+ADD required`;
+        }
       }
 
       if (existing === null) {
@@ -159,6 +265,8 @@ export async function reconcileRelations(
           }
         }
         results.push({ kind: "relations", label, action: "created" });
+      } else if (fkDriftMismatch) {
+        results.push({ kind: "relations", label, action: "failed", reason: fkDriftMismatch });
       } else if (fkDrift) {
         if (!input.opts.dryRun) {
           try {
@@ -173,8 +281,23 @@ export async function reconcileRelations(
             };
             const inner = r?.results?.[0];
             if (!r?.success || !inner?.success) {
-              const reason = inner?.error ?? "raw-query rejected ALTER TABLE";
-              results.push({ kind: "relations", label, action: "failed", reason });
+              const baseReason = inner?.error ?? "raw-query rejected ALTER TABLE";
+              // #22: orphans are the common cause of ADD CONSTRAINT failing
+              // ("violates foreign key constraint" without a count). Try to
+              // enrich the failure with a specific number.
+              const orphanNote = await summarizeOrphans(
+                input.client,
+                collection,
+                field,
+                String(desiredSchema!.foreign_key_table),
+                String(desiredSchema!.foreign_key_column ?? "id"),
+              );
+              results.push({
+                kind: "relations",
+                label,
+                action: "failed",
+                reason: `${baseReason}${orphanNote ?? ""}`,
+              });
               continue;
             }
           } catch (e) {

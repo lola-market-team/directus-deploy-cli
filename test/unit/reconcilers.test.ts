@@ -374,7 +374,10 @@ describe("reconcileRelations", () => {
           success: true,
           data: [{
             table_name: "sale_gift_transactions",
+            column_name: "user_created",
             constraint_name: "sale_gift_transactions_user_created_foreign",
+            referenced_table: "directus_users",
+            referenced_column: "id",
           }],
         }],
       })),
@@ -406,9 +409,11 @@ describe("reconcileRelations", () => {
     expect(client.patch).not.toHaveBeenCalled();
   });
 
-  it("skips FK-drift check gracefully when /raw-query/execute unavailable", async () => {
+  it("skips FK-drift check gracefully when /raw-query/execute unavailable, and warns (#19)", async () => {
     // Some targets don't have the raw-query extension. FK repair silently
-    // no-ops rather than failing — same behavior as fetchUnknownFields.
+    // no-ops rather than failing, but we surface a warning so drift on such
+    // envs is at least visible.
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     const client = mockClient({
       get: vi.fn(async () => ({
         collection: "x",
@@ -434,9 +439,185 @@ describe("reconcileRelations", () => {
       client,
       opts: { dryRun: false },
     });
-    // Skipped FK check ⇒ treat as unchanged. Not perfect, but the old
-    // behavior — false-positive drift loop is avoided by fields FK-stripping.
     expect(results[0]!.action).toBe("unchanged");
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/could not query information_schema.table_constraints.*FK drift check skipped for 1 relation/s),
+    );
+    stderrSpy.mockRestore();
+  });
+
+  it("does NOT flag drift when constraint_name differs but column FK points at right target (#18)", async () => {
+    // Snapshot pins '<coll>_<field>_foreign' (Directus default) but Postgres
+    // has the same column-level FK under a legacy '<coll>_<field>_fkey' name.
+    // Same semantic FK — should NOT report drift.
+    const client = mockClient({
+      get: vi.fn(async () => ({
+        collection: "sale_gift_transactions",
+        field: "user_created",
+        meta: {},
+        schema: { constraint_name: "sale_gift_transactions_user_created_foreign" },
+      })),
+      postRaw: vi.fn(async () => ({
+        success: true,
+        results: [{
+          success: true,
+          data: [{
+            table_name: "sale_gift_transactions",
+            column_name: "user_created",
+            constraint_name: "sale_gift_transactions_user_created_fkey", // ← different name
+            referenced_table: "directus_users",
+            referenced_column: "id",
+          }],
+        }],
+      })),
+    });
+    const rels = new Map<string, Record<string, unknown>[]>();
+    rels.set("sale_gift_transactions", [
+      {
+        collection: "sale_gift_transactions",
+        field: "user_created",
+        meta: {},
+        schema: {
+          constraint_name: "sale_gift_transactions_user_created_foreign",
+          foreign_key_table: "directus_users",
+          foreign_key_column: "id",
+        },
+      },
+    ]);
+    const results = await reconcileRelations({
+      relationsByCollection: rels,
+      client,
+      opts: { dryRun: false },
+    });
+    expect(results[0]!.action).toBe("unchanged");
+  });
+
+  it("fails loudly instead of auto-repairing when FK on column points at wrong target (#18)", async () => {
+    // Very rare drift shape: column IS FK'd, but at the wrong parent. Don't
+    // auto-DROP+ADD — data guarantees could break. Human decision required.
+    const client = mockClient({
+      get: vi.fn(async () => ({
+        collection: "x",
+        field: "y",
+        meta: {},
+        schema: {},
+      })),
+      postRaw: vi.fn(async () => ({
+        success: true,
+        results: [{
+          success: true,
+          data: [{
+            table_name: "x",
+            column_name: "y",
+            constraint_name: "x_y_fk_wrong",
+            referenced_table: "wrong_target",
+            referenced_column: "id",
+          }],
+        }],
+      })),
+    });
+    const rels = new Map<string, Record<string, unknown>[]>();
+    rels.set("x", [
+      {
+        collection: "x",
+        field: "y",
+        meta: {},
+        schema: { foreign_key_table: "right_target", foreign_key_column: "id" },
+      },
+    ]);
+    const results = await reconcileRelations({
+      relationsByCollection: rels,
+      client,
+      opts: { dryRun: false },
+    });
+    expect(results[0]!.action).toBe("failed");
+    expect(results[0]!.reason).toMatch(/points to wrong_target\.id.*expects right_target\.id.*manual DROP\+ADD/);
+  });
+
+  it("skips relations whose foreign_key_schema is not 'public' (#20)", async () => {
+    const client = mockClient({
+      get: vi.fn(async () => ({
+        collection: "x",
+        field: "y",
+        meta: {},
+      })),
+      postRaw: vi.fn(async () => ({ success: true, results: [{ success: true, data: [] }] })),
+    });
+    const rels = new Map<string, Record<string, unknown>[]>();
+    rels.set("x", [
+      {
+        collection: "x",
+        field: "y",
+        meta: {},
+        schema: {
+          foreign_key_table: "external_t",
+          foreign_key_column: "id",
+          foreign_key_schema: "reporting", // non-public
+        },
+      },
+    ]);
+    const results = await reconcileRelations({
+      relationsByCollection: rels,
+      client,
+      opts: { dryRun: false },
+    });
+    expect(results[0]!.action).toBe("skipped");
+    expect(results[0]!.reason).toMatch(/non-public/);
+    // Skipped relations never issue the ALTER TABLE
+    const rawCalls = (client.postRaw as ReturnType<typeof vi.fn>).mock.calls;
+    for (const call of rawCalls) {
+      expect((call[1] as { query: string }).query).not.toMatch(/ALTER TABLE/);
+    }
+  });
+
+  it("adds orphan diagnostic to failure reason when ALTER TABLE ADD CONSTRAINT fails (#22)", async () => {
+    // ADD CONSTRAINT fails when child rows point at nonexistent parents.
+    // Enrich the failure with the actual orphan count so the operator
+    // knows whether it's 3 rows or 3 million.
+    const client = mockClient({
+      get: vi.fn(async () => ({
+        collection: "sale_gift_transactions",
+        field: "user_created",
+        meta: {},
+        schema: {},
+      })),
+      postRaw: vi.fn(async (_: string, body: unknown) => {
+        const query = (body as { query: string }).query;
+        if (query.includes("information_schema.table_constraints")) {
+          return { success: true, results: [{ success: true, data: [] }] }; // FK missing
+        }
+        if (query.startsWith("ALTER TABLE")) {
+          return {
+            success: true,
+            results: [{ success: false, error: "insert or update on table violates foreign key constraint" }],
+          };
+        }
+        if (query.startsWith("SELECT COUNT")) {
+          return { success: true, results: [{ success: true, data: [{ n: 7 }] }] };
+        }
+        return { success: false };
+      }),
+    });
+    const rels = new Map<string, Record<string, unknown>[]>();
+    rels.set("sale_gift_transactions", [
+      {
+        collection: "sale_gift_transactions",
+        field: "user_created",
+        meta: {},
+        schema: {
+          foreign_key_table: "directus_users",
+          foreign_key_column: "id",
+        },
+      },
+    ]);
+    const results = await reconcileRelations({
+      relationsByCollection: rels,
+      client,
+      opts: { dryRun: false },
+    });
+    expect(results[0]!.action).toBe("failed");
+    expect(results[0]!.reason).toMatch(/foreign key constraint/);
+    expect(results[0]!.reason).toMatch(/7 orphan row\(s\) in sale_gift_transactions\.user_created reference directus_users\.id/);
   });
 
   it("FK-drift path is a no-op under dryRun", async () => {
