@@ -43,6 +43,22 @@ describe("verify semantics", () => {
     expect(drift).toBeGreaterThan(0);
   });
 
+  it("distinguishes unmappable-but-registered columns from genuine misses", () => {
+    // Mirrors real prod data. type='unknown' alone is NOT a miss — Directus
+    // reports it for any column it cannot map, and pgvector / tstzrange
+    // columns are permanently in that state with nothing to fix. The miss is
+    // the absence of a directus_fields row, which the API surfaces as
+    // meta=null.
+    const apiFields = [
+      { collection: "categories", field: "embedding", type: "unknown", meta: null },
+      { collection: "listings", field: "embedding", type: "unknown", meta: { hidden: true } },
+      { collection: "rentals", field: "period", type: "unknown", meta: { hidden: true } },
+      { collection: "listings", field: "title", type: "string", meta: { hidden: false } },
+    ];
+    const misses = apiFields.filter((f) => f.type === "unknown" && f.meta == null);
+    expect(misses.map((m) => `${m.collection}.${m.field}`)).toEqual(["categories.embedding"]);
+  });
+
   it("fails when an entity would be created", () => {
     const report = summarize(
       [{ kind: "collections", label: "listings", action: "created" }],
