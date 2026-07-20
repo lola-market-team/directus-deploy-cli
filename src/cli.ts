@@ -4,7 +4,6 @@ import { readFileSync, existsSync } from "node:fs";
 import { run } from "./runner.js";
 import { formatHuman, formatJson } from "./report.js";
 import { createDirectusClient } from "./http.js";
-import { readRegisterManifests } from "./manifest.js";
 import type { ApplyOptions } from "./types.js";
 
 // Auto-load .env from cwd so `npx directus-deploy diff --target test` works
@@ -213,9 +212,9 @@ async function execute(mode: ExecuteOptions, flags: CommonFlags): Promise<number
       );
       return 1;
     }
-    // Server-side gate: any `directus_fields.type = 'unknown'` row on the
-    // target means a raw-SQL column was added but never registered — either
-    // via `migrations/register/<table>.json` or by a Directus-native field
+    // Server-side gate: a column that exists in the database with no
+    // directus_fields row was added by raw SQL and never registered — via
+    // `migrations/register/<table>.json` or a Directus-native field
     // definition. Fail fast so the miss surfaces here, not in a UI 500.
     const unknowns = await fetchUnknownFields(client);
     if ("error" in unknowns) {
@@ -226,17 +225,14 @@ async function execute(mode: ExecuteOptions, flags: CommonFlags): Promise<number
       );
       return 1;
     }
-    // Columns Directus cannot type are expected when a register manifest owns
-    // the collection — pgvector embeddings and tstzrange periods are the
-    // standing cases. The manifest is the registration, so those are not
-    // misses. Anything left is a raw-SQL column registered by nothing.
-    const owned = await readRegisterManifests(common.registerDir);
-    const misses = unknowns.fields.filter((u) => !owned.has(u.collection));
-    if (misses.length > 0) {
+    // fetchUnknownFields already narrows to columns with no directus_fields
+    // row, so anything here is a raw-SQL column registered by nothing —
+    // regardless of which collection it sits in.
+    if (unknowns.fields.length > 0) {
       process.stderr.write(
-        `verify: ${misses.length} field(s) have type='unknown' on target and no register manifest — add a register manifest or Directus field definition:\n`,
+        `verify: ${unknowns.fields.length} column(s) exist in the database with no directus_fields row — add a register manifest or a Directus field definition:\n`,
       );
-      for (const u of misses) {
+      for (const u of unknowns.fields) {
         process.stderr.write(`  ${u.collection}.${u.field}\n`);
       }
       return 1;
@@ -270,8 +266,17 @@ async function fetchUnknownFields(
   const out: Array<{ collection: string; field: string }> = [];
   for (const row of raw) {
     if (!row || typeof row !== "object") continue;
-    const rr = row as { collection?: unknown; field?: unknown; type?: unknown };
+    const rr = row as { collection?: unknown; field?: unknown; type?: unknown; meta?: unknown };
     if (rr.type !== "unknown") continue;
+    // type=unknown alone is not a miss. Directus reports it for any column it
+    // cannot map — pgvector embeddings and tstzrange periods are permanently
+    // in that state and there is nothing to fix about them. What distinguishes
+    // a real miss is the absence of a directus_fields row, which the API
+    // surfaces as meta=null. Verified against prod: listings.embedding and the
+    // three .period columns are registered (meta present) and unmappable;
+    // categories.embedding has meta=null and is genuinely registered by
+    // nothing.
+    if (rr.meta !== null && rr.meta !== undefined) continue;
     out.push({ collection: String(rr.collection), field: String(rr.field) });
   }
   out.sort((a, b) =>
