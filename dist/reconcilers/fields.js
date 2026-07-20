@@ -48,11 +48,22 @@ export async function reconcileFields(input) {
                 results.push({ kind: "fields", label, action: "failed", reason: e.message });
                 continue;
             }
-            // Skip fields that Directus tracks as adopted-but-unregistered
-            // (type=unknown, meta=null). Patching would silently promote them into
-            // managed state and diverge from the DB.
-            if (existing !== null &&
-                (existing["type"] === "unknown" || existing["meta"] === null || existing["meta"] === undefined)) {
+            // Skip columns Directus cannot type. type=unknown means the DB column
+            // exists but Directus has no mapping for it (pgvector is the case that
+            // broke embeddings on test/staging) — asserting a type from the
+            // snapshot would try to ALTER a column Directus doesn't understand.
+            //
+            // meta=null ALONE is a different state and must NOT be skipped. It means
+            // Directus typed the column fine but there is no directus_fields row —
+            // i.e. the column is simply unregistered. Register-manifest-owned tables
+            // already returned above, so reaching here means the snapshot is the
+            // declared owner and PATCH is exactly how the field gets its row.
+            // Skipping it was self-perpetuating: the field stayed unregistered
+            // because it was unregistered, reported `skipped` (never `failed`), and
+            // so every apply looked clean while the column stayed invisible to the
+            // API, GraphQL and the admin UI. That is how directus_users.charges_vat
+            // / org_type / zvr sat unregistered on prod for months.
+            if (existing !== null && existing["type"] === "unknown") {
                 results.push({
                     kind: "fields",
                     label,
@@ -103,11 +114,18 @@ export async function reconcileFields(input) {
                             continue;
                         }
                     }
+                    // Distinguish "this column had no directus_fields row at all" from an
+                    // ordinary meta drift. Both are a PATCH, but only the first one means
+                    // the field was invisible to the API until now — worth saying so in
+                    // the deploy log rather than reporting it as `meta.note` drift.
+                    const wasUnregistered = existing["meta"] === null || existing["meta"] === undefined;
                     results.push({
                         kind: "fields",
                         label,
                         action: "updated",
-                        reason: formatDiffPath(dp),
+                        reason: wasUnregistered
+                            ? "registered previously-unmanaged column (no directus_fields row)"
+                            : formatDiffPath(dp),
                     });
                 }
                 else {

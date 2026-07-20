@@ -4,6 +4,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { run } from "./runner.js";
 import { formatHuman, formatJson } from "./report.js";
 import { createDirectusClient } from "./http.js";
+import { readRegisterManifests } from "./manifest.js";
 // Auto-load .env from cwd so `npx directus-deploy diff --target test` works
 // without asking every user to remember `set -a; source .env; set +a`.
 // Never overrides existing process.env — shell always wins.
@@ -168,12 +169,21 @@ async function execute(mode, flags) {
         // via `migrations/register/<table>.json` or by a Directus-native field
         // definition. Fail fast so the miss surfaces here, not in a UI 500.
         const unknowns = await fetchUnknownFields(client);
-        if (unknowns === null) {
-            process.stderr.write(`verify: could not query directus_fields for type=unknown (raw-query endpoint unavailable?) — skipping check\n`);
+        if ("error" in unknowns) {
+            // A backstop that cannot run is a failure, not a footnote. Reporting
+            // this as a skip is what let the check sit broken indefinitely.
+            process.stderr.write(`verify: could not read /fields to check for type='unknown': ${unknowns.error}\n`);
+            return 1;
         }
-        else if (unknowns.length > 0) {
-            process.stderr.write(`verify: ${unknowns.length} field(s) have type='unknown' on target — add a register manifest or Directus field definition:\n`);
-            for (const u of unknowns) {
+        // Columns Directus cannot type are expected when a register manifest owns
+        // the collection — pgvector embeddings and tstzrange periods are the
+        // standing cases. The manifest is the registration, so those are not
+        // misses. Anything left is a raw-SQL column registered by nothing.
+        const owned = await readRegisterManifests(common.registerDir);
+        const misses = unknowns.fields.filter((u) => !owned.has(u.collection));
+        if (misses.length > 0) {
+            process.stderr.write(`verify: ${misses.length} field(s) have type='unknown' on target and no register manifest — add a register manifest or Directus field definition:\n`);
+            for (const u of misses) {
                 process.stderr.write(`  ${u.collection}.${u.field}\n`);
             }
             return 1;
@@ -181,26 +191,40 @@ async function execute(mode, flags) {
     }
     return 0;
 }
+// `type` is NOT a column on directus_fields — that table stores meta only
+// (id, collection, field, special, interface, options, …). Directus computes
+// `type` from DB introspection and exposes it on GET /fields. The previous
+// implementation queried `directus_fields WHERE type = 'unknown'` over
+// raw-query, which always failed with `column "type" does not exist` and was
+// swallowed into "raw-query endpoint unavailable?". The check therefore never
+// ran, on any target, since it was written — while reporting success.
+//
+// Returns null only when the field list genuinely cannot be read; the caller
+// treats that as a hard failure rather than a silent skip.
 async function fetchUnknownFields(client) {
+    let raw;
     try {
-        const r = (await client.postRaw("/raw-query/execute", {
-            query: "SELECT collection, field FROM directus_fields WHERE type = 'unknown' ORDER BY collection, field",
-        }));
-        const inner = r?.results?.[0];
-        if (!r?.success || !inner?.success)
-            return null;
-        const out = [];
-        for (const row of inner.data ?? []) {
-            if (row && typeof row === "object" && "collection" in row && "field" in row) {
-                const rr = row;
-                out.push({ collection: String(rr.collection), field: String(rr.field) });
-            }
-        }
-        return out;
+        raw = await client.get("/fields");
     }
-    catch {
-        return null;
+    catch (e) {
+        return { error: e.message };
     }
+    if (!Array.isArray(raw)) {
+        return { error: `GET /fields returned ${typeof raw}, expected an array` };
+    }
+    const out = [];
+    for (const row of raw) {
+        if (!row || typeof row !== "object")
+            continue;
+        const rr = row;
+        if (rr.type !== "unknown")
+            continue;
+        out.push({ collection: String(rr.collection), field: String(rr.field) });
+    }
+    out.sort((a, b) => a.collection === b.collection
+        ? a.field.localeCompare(b.field)
+        : a.collection.localeCompare(b.collection));
+    return { fields: out };
 }
 const program = new Command();
 program
