@@ -1,6 +1,6 @@
 import { readdir, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 async function readJson(path) {
     try {
         return JSON.parse(await readFile(path, "utf8"));
@@ -151,31 +151,55 @@ async function checkRegisterManifestPairing(registerDir, known, fieldsDir, root)
     }
     return offenders;
 }
+// Every directory that can hold migrations: the repo-root migrations/ AND
+// each extensions/<name>/migrations/. Both feed the same tracker (extension
+// files under `ext/<name>/<file>` keys) and both are applied by the same
+// reconciler, so a hazard in one is a hazard in the other.
+//
+// This check used to scan only the root dir. The gap was not theoretical: a
+// `;` inside a `--` comment in extensions/rental-fsm/migrations/074 reached a
+// live target, where the server-side splitter chopped the file mid-statement
+// and the DROP CONSTRAINT never ran — while the apply reported success and the
+// schema was silently unchanged.
+async function migrationDirs(migrationsDir) {
+    const dirs = [migrationsDir];
+    // migrationsDir is <repo>/migrations, so extensions/ is its sibling.
+    const extensionsRoot = join(dirname(migrationsDir), "extensions");
+    const entries = await readdir(extensionsRoot, { withFileTypes: true }).catch(() => []);
+    for (const e of entries) {
+        if (!e.isDirectory())
+            continue;
+        const candidate = join(extensionsRoot, e.name, "migrations");
+        const stat = await readdir(candidate).catch(() => null);
+        if (stat)
+            dirs.push(candidate);
+    }
+    return dirs;
+}
 async function checkMigrationCommentSemicolons(migrationsDir, root) {
     const offenders = [];
-    const entries = await listJson(migrationsDir); // returns .json — we need .sql
-    const sqlFiles = (await readdir(migrationsDir).catch(() => []))
-        .filter((f) => f.endsWith(".sql"))
-        .sort();
-    // Ignore returned .json listing — we walk .sql directly.
-    void entries;
     const commentRe = /^\s*--.*;/;
-    for (const f of sqlFiles) {
-        const path = join(migrationsDir, f);
-        let raw;
-        try {
-            raw = await readFile(path, "utf8");
-        }
-        catch {
-            continue;
-        }
-        const lines = raw.split("\n");
-        for (let i = 0; i < lines.length; i++) {
-            if (commentRe.test(lines[i])) {
-                offenders.push({
-                    file: `${rel(root, path)}:${i + 1}`,
-                    message: "'--' line contains ';' — raw-query's naive splitter will chop the file here",
-                });
+    for (const dir of await migrationDirs(migrationsDir)) {
+        const sqlFiles = (await readdir(dir).catch(() => []))
+            .filter((f) => f.endsWith(".sql"))
+            .sort();
+        for (const f of sqlFiles) {
+            const path = join(dir, f);
+            let raw;
+            try {
+                raw = await readFile(path, "utf8");
+            }
+            catch {
+                continue;
+            }
+            const lines = raw.split("\n");
+            for (let i = 0; i < lines.length; i++) {
+                if (commentRe.test(lines[i])) {
+                    offenders.push({
+                        file: `${rel(root, path)}:${i + 1}`,
+                        message: "'--' line contains ';' — raw-query's naive splitter will chop the file here",
+                    });
+                }
             }
         }
     }
