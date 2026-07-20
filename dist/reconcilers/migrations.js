@@ -72,6 +72,52 @@ function stripLeadingComments(s) {
 function sha256(s) {
     return createHash("sha256").update(s).digest("hex");
 }
+// Immutability should constrain what a migration DOES, not its bytes.
+//
+// Hashing raw content means a typo fix or a corrected comment in an applied
+// migration trips the content check and blocks every subsequent apply, on
+// every environment — strictly worse than the mistake being fixed. It also
+// makes lint findings unfixable: `snapshot lint` flags a ';' inside a '--'
+// comment (raw-query's splitter has no comment awareness and chops there),
+// but removing that ';' changes the hash. 96 such findings exist across 48
+// already-applied migrations in one consuming repo, none of them fixable
+// while the hash covers comments.
+//
+// So hash the executable SQL: strip line comments, drop blank lines, collapse
+// runs of whitespace, and trim. Two files that differ only in commentary
+// normalize to the same digest; any change to a statement still changes it.
+//
+// Deliberately NOT stripped: block comments. `/* ... */` can appear mid-expression
+// where removing it would join tokens, and the existing splitter does not track
+// them either. Line comments are safe because they always run to end-of-line.
+export function normalizeSqlForHash(raw) {
+    return raw
+        .split("\n")
+        .map((line) => {
+        // Strip a '--' comment only when it is not inside a string literal.
+        // Counting quotes is enough here: SQL escapes a quote by doubling it,
+        // so a doubled quote leaves the parity unchanged.
+        let inSingle = false;
+        let inDouble = false;
+        for (let i = 0; i < line.length; i++) {
+            const c = line[i];
+            if (c === "'" && !inDouble)
+                inSingle = !inSingle;
+            else if (c === '"' && !inSingle)
+                inDouble = !inDouble;
+            else if (c === "-" && line[i + 1] === "-" && !inSingle && !inDouble) {
+                return line.slice(0, i);
+            }
+        }
+        return line;
+    })
+        .map((line) => line.replace(/\s+/g, " ").trim())
+        .filter((line) => line.length > 0)
+        // Join with a space, not a newline: a statement reflowed across lines is
+        // the same statement, and newlines carry no meaning in SQL outside string
+        // literals (which are preserved intact above).
+        .join(" ");
+}
 async function ensureTracker(client) {
     const r = await rawQuery(client, CREATE_TRACKER);
     return !!r?.success && !!r?.results?.[0]?.success;
@@ -123,7 +169,8 @@ async function readSqlDir(dir, keyPrefix) {
             filename,
             path,
             raw,
-            hash: sha256(raw),
+            hash: sha256(normalizeSqlForHash(raw)),
+            legacyHash: sha256(raw),
         });
     }
     return out;
@@ -189,13 +236,31 @@ export async function reconcileMigrations(input) {
             results.push({ kind: "migrations", label, action: "unchanged" });
             continue;
         }
-        // MUTATED — recorded under a different hash. Never rewrite silently.
-        if (recordedHash !== undefined && recordedHash !== file.hash) {
+        // Rows written before 0.17 hold a hash of the raw bytes. Accept that as a
+        // match and re-baseline to the normalized digest, so the transition costs
+        // nobody a false "content mismatch" on their first upgrade. Only the
+        // stored hash changes; the migration is not re-run.
+        if (recordedHash === file.legacyHash) {
+            if (!input.opts.dryRun) {
+                await rawQuery(input.client, `UPDATE ${TRACKER_TABLE} SET sha256 = ${sqlLiteral(file.hash)} WHERE filename = ${sqlLiteral(file.key)}`);
+            }
+            results.push({
+                kind: "migrations",
+                label,
+                action: "unchanged",
+                reason: "re-baselined to comment-insensitive hash",
+            });
+            continue;
+        }
+        // MUTATED — the executable SQL differs, not just commentary. Never rewrite
+        // silently. Comment-only edits no longer reach here: they normalize to the
+        // recorded hash above.
+        if (recordedHash !== undefined) {
             results.push({
                 kind: "migrations",
                 label,
                 action: "failed",
-                reason: `content mismatch: tracker recorded sha256 ${recordedHash.slice(0, 12)}…, file now hashes to ${file.hash.slice(0, 12)}…. Migrations are immutable — add a new migration instead.`,
+                reason: `content mismatch: tracker recorded sha256 ${recordedHash.slice(0, 12)}…, file's SQL now hashes to ${file.hash.slice(0, 12)}… (comments ignored). Migrations are immutable — add a new migration instead.`,
             });
             continue;
         }
