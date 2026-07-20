@@ -3,7 +3,7 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { adoptMigrations, reconcileMigrations } from "../../src/reconcilers/migrations.js";
+import { adoptMigrations, normalizeSqlForHash, reconcileMigrations } from "../../src/reconcilers/migrations.js";
 import type { DirectusClient } from "../../src/types.js";
 
 function sha256(s: string): string {
@@ -248,5 +248,50 @@ describe("adoptMigrations", () => {
     expect(results[0]!.action).toBe("failed");
     expect(results[0]!.reason).toMatch(/already adopted/);
     expect(fake.tracker.get("01.sql")).toBe(staleHash);
+  });
+});
+
+describe("normalizeSqlForHash", () => {
+  it("ignores comment-only differences", () => {
+    // The whole point: fixing a typo or removing a ';' from a comment in an
+    // applied migration must not trip the immutability check.
+    const before = `-- adds max_uses to cap redemptions;\nALTER TABLE t ADD COLUMN a int;\n`;
+    const after = `-- adds max_uses to cap redemptions.\n-- extra prose nobody executes\nALTER TABLE t ADD COLUMN a int;\n`;
+    expect(normalizeSqlForHash(before)).toBe(normalizeSqlForHash(after));
+  });
+
+  it("ignores whitespace and blank-line churn", () => {
+    const a = `ALTER TABLE t ADD COLUMN a int;`;
+    const b = `\n\nALTER  TABLE   t\n  ADD COLUMN a int;\n\n`;
+    expect(normalizeSqlForHash(a)).toBe(normalizeSqlForHash(b));
+  });
+
+  it("still detects a real SQL change", () => {
+    const a = `ALTER TABLE t ADD COLUMN a int;`;
+    const b = `ALTER TABLE t ADD COLUMN a bigint;`;
+    expect(normalizeSqlForHash(a)).not.toBe(normalizeSqlForHash(b));
+  });
+
+  it("does not strip a '--' inside a string literal", () => {
+    // Naive comment stripping would truncate this INSERT mid-value and make
+    // two genuinely different migrations hash identically.
+    const a = `INSERT INTO t (note) VALUES ('a -- not a comment');`;
+    const b = `INSERT INTO t (note) VALUES ('a -- different text');`;
+    expect(normalizeSqlForHash(a)).toContain("-- not a comment");
+    expect(normalizeSqlForHash(a)).not.toBe(normalizeSqlForHash(b));
+  });
+
+  it("handles doubled quotes without losing track of the literal", () => {
+    // SQL escapes a quote by doubling it; parity must survive that.
+    const sql = `INSERT INTO t (note) VALUES ('it''s fine'); -- trailing comment`;
+    const out = normalizeSqlForHash(sql);
+    expect(out).toContain("it''s fine");
+    expect(out).not.toContain("trailing comment");
+  });
+
+  it("leaves block comments alone", () => {
+    // /* */ can sit mid-expression where removing it would join tokens.
+    const sql = `SELECT a /* inline */ FROM t;`;
+    expect(normalizeSqlForHash(sql)).toContain("/* inline */");
   });
 });
