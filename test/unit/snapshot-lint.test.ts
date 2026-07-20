@@ -27,6 +27,35 @@ async function scratchRepo(files: Record<string, string>): Promise<{
 }
 
 describe("lintSnapshot", () => {
+  it("flags ';' in a '--' comment inside extensions/<name>/migrations, not only root", async () => {
+    // Regression: the semicolon check scanned ONLY the repo-root migrations/.
+    // Extension migrations feed the same tracker and the same reconciler, so
+    // the hazard is identical — and it escaped. A ';' in a comment in
+    // extensions/rental-fsm/migrations/074 reached a live target, where the
+    // server-side splitter chopped the file mid-statement: the DROP CONSTRAINT
+    // never ran, while the apply reported success and the schema was silently
+    // unchanged.
+    const hazard = "-- drop by that name; guarded so a re-run is a no-op\nALTER TABLE t DROP CONSTRAINT IF EXISTS c;\n";
+    const { root, snapshotDir, migrationsDir, registerDir } = await scratchRepo({
+      "migrations/001_clean.sql": "-- no semicolon in this comment\nSELECT 1;\n",
+      "extensions/rental-fsm/migrations/074_hazard.sql": hazard,
+    });
+    const report = await lintSnapshot({ snapshotDir, migrationsDir, registerDir, root });
+    const hits = report.offenders.filter((o) => o.file.includes("074_hazard.sql"));
+    expect(hits).toHaveLength(1);
+    expect(hits[0]!.file).toContain("extensions/rental-fsm/migrations");
+    expect(hits[0]!.message).toContain("naive splitter");
+  });
+
+  it("still flags the root migrations/ dir", async () => {
+    const { root, snapshotDir, migrationsDir, registerDir } = await scratchRepo({
+      "migrations/002_hazard.sql": "-- one; two\nSELECT 1;\n",
+    });
+    const report = await lintSnapshot({ snapshotDir, migrationsDir, registerDir, root });
+    expect(report.offenders.some((o) => o.file.includes("002_hazard.sql"))).toBe(true);
+  });
+
+
   it("passes when everything resolves", async () => {
     const d = await scratchRepo({
       "directus_config/snapshot/collections/rentals.json": JSON.stringify({
