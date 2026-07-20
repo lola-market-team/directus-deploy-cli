@@ -22,6 +22,27 @@ describe("verify semantics", () => {
     expect(drift).toBe(0);
   });
 
+  it("fails on a column that exists in the DB with no directus_fields row", () => {
+    // Because `skipped` is deliberately not drift, anything the fields
+    // reconciler skips is invisible to verify. That is what let
+    // directus_users.charges_vat / org_type / zvr sit unregistered on prod:
+    // typed column, no directus_fields row, reported `skipped`, verify green.
+    // The reconciler now reports these as `updated`, so verify catches them.
+    const report = summarize(
+      [
+        {
+          kind: "fields",
+          label: "fields/directus_users.charges_vat",
+          action: "updated",
+          reason: "registered previously-unmanaged column (no directus_fields row)",
+        },
+      ],
+      "test",
+    );
+    const drift = report.counts.created + report.counts.updated;
+    expect(drift).toBeGreaterThan(0);
+  });
+
   it("fails when an entity would be created", () => {
     const report = summarize(
       [{ kind: "collections", label: "listings", action: "created" }],

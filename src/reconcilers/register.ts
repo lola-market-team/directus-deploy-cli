@@ -129,6 +129,30 @@ export async function reconcileRegister(
       continue;
     }
 
+    // Directus system collections must never go through register. Two ways
+    // this reconciler would actively corrupt them:
+    //   1. Adoption below INSERTs a directus_collections row when none exists.
+    //      System collections are runtime-provided and have no such row, so it
+    //      would fabricate a user-collection row shadowing directus_users.
+    //   2. Column registration walks every column lacking a directus_fields
+    //      row — for a system collection that is most of them, so it would
+    //      PATCH id, email, password, role.
+    // Custom columns on system collections belong in the snapshot instead
+    // (directus_config/snapshot/fields/<collection>/<column>.json); the fields
+    // reconciler registers them, including when the column already exists in
+    // Postgres with no directus_fields row.
+    if (table.startsWith("directus_")) {
+      results.push({
+        kind: "migrations",
+        label,
+        action: "failed",
+        reason:
+          `${table} is a Directus system collection — register manifests cannot own it. ` +
+          `Declare the column as a snapshot field instead.`,
+      });
+      continue;
+    }
+
     // 1. Table must exist.
     const exists = await rawQuery(
       input.client,

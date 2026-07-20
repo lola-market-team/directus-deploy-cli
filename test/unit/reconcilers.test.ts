@@ -143,6 +143,92 @@ describe("reconcileFields", () => {
     expect(results[0]!.reason).toMatch(/unregistered raw-SQL column/);
   });
 
+  it("still skips type=unknown even when meta is present", async () => {
+    // The pgvector guard keys on type, not meta — a column Directus can't map
+    // must never have a snapshot type asserted onto it.
+    const client = mockClient({
+      get: vi.fn(async () => ({ type: "unknown", meta: { hidden: false } })),
+    });
+    const fields = new Map<string, Record<string, unknown>[]>();
+    fields.set("categories", [
+      { collection: "categories", field: "embedding", type: "string", meta: { hidden: true } },
+    ]);
+    const results = await reconcileFields({
+      fieldsByCollection: fields,
+      registerManifests: new Set(),
+      client,
+      opts: { dryRun: false },
+    });
+    expect(results[0]!.action).toBe("skipped");
+    expect(client.patch).not.toHaveBeenCalled();
+  });
+
+  it("registers a typed column that has no directus_fields row (meta=null)", async () => {
+    // The directus_users.charges_vat case: the column exists in Postgres and
+    // Directus types it fine, but there is no directus_fields row, so meta is
+    // null. Previously this was skipped — which is self-perpetuating, since
+    // the skip is what kept it unregistered. It must PATCH.
+    const client = mockClient({
+      get: vi.fn(async () => ({
+        collection: "directus_users",
+        field: "charges_vat",
+        type: "boolean",
+        meta: null,
+        schema: { data_type: "boolean", default_value: true },
+      })),
+    });
+    const fields = new Map<string, Record<string, unknown>[]>();
+    fields.set("directus_users", [
+      {
+        collection: "directus_users",
+        field: "charges_vat",
+        type: "boolean",
+        meta: { hidden: false, interface: "boolean", note: "LOLA-936" },
+        schema: { data_type: "boolean", default_value: true },
+      },
+    ]);
+    const results = await reconcileFields({
+      fieldsByCollection: fields,
+      registerManifests: new Set(),
+      client,
+      opts: { dryRun: false },
+    });
+    expect(client.patch).toHaveBeenCalledWith(
+      "/fields/directus_users/charges_vat",
+      expect.objectContaining({
+        meta: expect.objectContaining({ interface: "boolean" }),
+      }),
+    );
+    // Schema is unchanged, so it must not ride along — a needless schema
+    // assertion on an existing column is what triggers ALTER COLUMN.
+    const patched = (client.patch as ReturnType<typeof vi.fn>).mock.calls[0][1] as Record<string, unknown>;
+    expect(patched.schema).toBeUndefined();
+    expect(results[0]!.action).toBe("updated");
+    expect(results[0]!.reason).toMatch(/previously-unmanaged/);
+  });
+
+  it("leaves register-manifest-owned tables to the register reconciler", async () => {
+    // Guards the ordering the fix depends on: manifest-owned tables return
+    // before the type/meta checks, so relaxing the meta guard cannot make the
+    // fields reconciler start fighting register over the same columns.
+    const client = mockClient({
+      get: vi.fn(async () => ({ type: "boolean", meta: null })),
+    });
+    const fields = new Map<string, Record<string, unknown>[]>();
+    fields.set("rental_holds", [
+      { collection: "rental_holds", field: "expires_at", type: "timestamp", meta: { hidden: true } },
+    ]);
+    const results = await reconcileFields({
+      fieldsByCollection: fields,
+      registerManifests: new Set(["rental_holds"]),
+      client,
+      opts: { dryRun: false },
+    });
+    expect(results[0]!.action).toBe("skipped");
+    expect(results[0]!.reason).toMatch(/raw-SQL adopted/);
+    expect(client.patch).not.toHaveBeenCalled();
+  });
+
   it("omits schema on PATCH when schema matches", async () => {
     const client = mockClient({
       get: vi.fn(async () => ({
