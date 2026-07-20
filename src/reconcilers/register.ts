@@ -201,6 +201,26 @@ export async function reconcileRegister(
           continue;
         }
         results.push({ kind: "migrations", label: `${label} (adopt)`, action: "created" });
+
+        // The adopt is a raw INSERT (POST /collections would try to CREATE the
+        // table), and a raw INSERT does not invalidate Directus's cached
+        // SchemaOverview. /fields/<collection>/<field> validates against that
+        // cache, so every column PATCH below then 403s with "You don't have
+        // permission to access collection X or it does not exist" — even for a
+        // full admin, where the operative half is "or it does not exist".
+        //
+        // So the reconciler creates the condition and trips over it two lines
+        // later. Clear the system cache here rather than leaving the caller to
+        // discover it: observed on a fresh test instance where all 7 column
+        // PATCHes failed twice, then all 7 succeeded immediately after this
+        // call. Best-effort — a failure here is not worth aborting the run,
+        // since the column PATCHes will report their own errors.
+        try {
+          await input.client.post("/utils/cache/clear?system=true", {});
+        } catch {
+          // Non-fatal: some deployments disable the cache endpoint. If the
+          // cache really was stale, the PATCHes below surface it.
+        }
       }
     }
 

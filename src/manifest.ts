@@ -61,7 +61,7 @@ async function readJsonArray(path: string): Promise<Record<string, unknown>[]> {
   }
 }
 
-async function readRegisterManifests(dir: string): Promise<Set<string>> {
+export async function readRegisterManifests(dir: string): Promise<Set<string>> {
   const set = new Set<string>();
   let entries: string[];
   try {

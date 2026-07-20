@@ -45,7 +45,7 @@ async function readJsonArray(path) {
         return [];
     }
 }
-async function readRegisterManifests(dir) {
+export async function readRegisterManifests(dir) {
     const set = new Set();
     let entries;
     try {

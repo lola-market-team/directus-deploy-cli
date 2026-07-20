@@ -90,6 +90,28 @@ export async function reconcileRegister(input) {
             });
             continue;
         }
+        // Directus system collections must never go through register. Two ways
+        // this reconciler would actively corrupt them:
+        //   1. Adoption below INSERTs a directus_collections row when none exists.
+        //      System collections are runtime-provided and have no such row, so it
+        //      would fabricate a user-collection row shadowing directus_users.
+        //   2. Column registration walks every column lacking a directus_fields
+        //      row — for a system collection that is most of them, so it would
+        //      PATCH id, email, password, role.
+        // Custom columns on system collections belong in the snapshot instead
+        // (directus_config/snapshot/fields/<collection>/<column>.json); the fields
+        // reconciler registers them, including when the column already exists in
+        // Postgres with no directus_fields row.
+        if (table.startsWith("directus_")) {
+            results.push({
+                kind: "migrations",
+                label,
+                action: "failed",
+                reason: `${table} is a Directus system collection — register manifests cannot own it. ` +
+                    `Declare the column as a snapshot field instead.`,
+            });
+            continue;
+        }
         // 1. Table must exist.
         const exists = await rawQuery(input.client, `SELECT 1 AS ok FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ${sqlLiteral(table)}`);
         if (!exists.ok || exists.data.length === 0) {
@@ -129,6 +151,26 @@ export async function reconcileRegister(input) {
                     continue;
                 }
                 results.push({ kind: "migrations", label: `${label} (adopt)`, action: "created" });
+                // The adopt is a raw INSERT (POST /collections would try to CREATE the
+                // table), and a raw INSERT does not invalidate Directus's cached
+                // SchemaOverview. /fields/<collection>/<field> validates against that
+                // cache, so every column PATCH below then 403s with "You don't have
+                // permission to access collection X or it does not exist" — even for a
+                // full admin, where the operative half is "or it does not exist".
+                //
+                // So the reconciler creates the condition and trips over it two lines
+                // later. Clear the system cache here rather than leaving the caller to
+                // discover it: observed on a fresh test instance where all 7 column
+                // PATCHes failed twice, then all 7 succeeded immediately after this
+                // call. Best-effort — a failure here is not worth aborting the run,
+                // since the column PATCHes will report their own errors.
+                try {
+                    await input.client.post("/utils/cache/clear?system=true", {});
+                }
+                catch {
+                    // Non-fatal: some deployments disable the cache endpoint. If the
+                    // cache really was stale, the PATCHes below surface it.
+                }
             }
         }
         // 3. Register unregistered columns.
