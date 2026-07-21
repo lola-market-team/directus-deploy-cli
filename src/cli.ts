@@ -296,7 +296,36 @@ program
   .description(
     "Reconcile a Directus environment to the state described in directus_config/snapshot/. Per-entity, non-atomic.",
   )
-  .version(pkg.version);
+  .version(pkg.version)
+  .addHelpText(
+    "after",
+    `
+AGENT QUICKSTART (sandboxed callers: everything below is HTTPS-only — no SSH,
+no gsutil, no gcloud needed; credentials come from env by convention):
+
+  Wake a sleeping env (needs control_url in targets + DIRECTUS_<T>_INVOKER_KEY_B64):
+    directus-deploy vm start --target test        # no-op if healthy, else boots + waits
+
+  Is the env in sync with its branch?
+    directus-deploy overview --targets test --json
+
+  Deploy config/seeds from the CURRENT CHECKOUT (check out the right ref first!):
+    directus-deploy apply --target test --entities collections,fields,relations,roles,policies,permissions,flows,operations,seeds
+    (never auto-apply raw-SQL migrations to shared envs — use 'migrations lint' to check them)
+
+  Build + deploy ONE extension without SSH (publish uploads via GCS REST,
+  promote installs through the env's control function):
+    directus-deploy extensions push <name> --target test --publish
+    directus-deploy extensions promote <name> --target test --via control
+
+  Verify what's actually running:
+    directus-deploy extensions status --target test
+
+Every command supports --help and fails with the exact env var or targets-file
+field it is missing. Legacy SSH paths (extensions push without --publish,
+promote without --via control) require ssh/rsync/gsutil binaries and network
+egress on port 22 — unavailable in most agent sandboxes.`,
+  );
 
 function attachCommon(cmd: Command): Command {
   return cmd
