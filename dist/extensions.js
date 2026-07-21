@@ -380,8 +380,14 @@ async function publishTarball(input) {
     // COPYFILE_DISABLE + --no-mac-metadata strip Darwin's AppleDouble headers
     // so GNU tar on the VM doesn't spew "Ignoring unknown extended header
     // keyword" warnings on extract. Matches scripts/build-extension.sh.
+    //
+    // --format=ustar (supported by both GNU tar and bsdtar) pins the archive to
+    // plain USTAR: bsdtar defaults to PAX and GNU tar to its own format, and
+    // strict/minimal readers — the ext-deploy endpoint's Node tar parser — only
+    // accept USTAR. Extension bundles (short names, small files) fit USTAR's
+    // limits with room to spare.
     const isDarwin = process.platform === "darwin";
-    const tarArgs = ["-C", extDir];
+    const tarArgs = ["-C", extDir, "--format=ustar"];
     if (isDarwin)
         tarArgs.push("--no-mac-metadata");
     tarArgs.push("-cf", "-", "dist", "package.json");
