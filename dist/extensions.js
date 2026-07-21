@@ -221,6 +221,25 @@ export async function pushExtension(input) {
             uploadDurationMs: Date.now() - uploadStart,
         };
     }
+    // Control transport: the artifact is in the bucket; install it through the
+    // target's control function (same install script, SSH executed inside GCP)
+    // and verify /_meta. No SSH leaves this process.
+    if (input.via === "control") {
+        const ctl = resolveVmControl(input.target, target, process.env);
+        const transportStart = Date.now();
+        await callControl(ctl, "deploy", { name: input.extensionName, sha: artifactSourceCommit });
+        const transportDurationMs = Date.now() - transportStart;
+        const verifiedCommit = await verifyMeta(target.base_url, input.extensionName, sourceCommit);
+        return {
+            extensionName: input.extensionName,
+            target: input.target,
+            sourceCommit,
+            buildDurationMs,
+            transportDurationMs,
+            verifiedCommit,
+            artifact,
+        };
+    }
     const remoteBase = target.remote_extensions_path.replace(/\/+$/, "");
     const remoteFinal = `${remoteBase}/${input.extensionName}/dist`;
     const remoteStage = `${remoteBase}/${input.extensionName}/dist_new`;

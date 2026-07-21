@@ -39,6 +39,9 @@ export interface PushInput {
   repoRoot: string;
   skipBuild?: boolean;
   publish?: boolean;      // also upload the built tarball to gs://<bucket>/<name>/<sha>.tgz
+  via?: "ssh" | "control"; // transport: rsync/SSH directly (default), or the target's
+                           // control_url function — implies publish; for callers with no
+                           // SSH egress (agent sandboxes). Same semantics as promote --via.
   allowDirty?: boolean;   // permit dirty worktree when publishing (never for prod)
   force?: boolean;        // overwrite an existing artifact
 }
@@ -286,6 +289,26 @@ export async function pushExtension(input: PushInput): Promise<PushResult> {
       sha256: r.sha256,
       alreadyPublished: r.alreadyPublished,
       uploadDurationMs: Date.now() - uploadStart,
+    };
+  }
+
+  // Control transport: the artifact is in the bucket; install it through the
+  // target's control function (same install script, SSH executed inside GCP)
+  // and verify /_meta. No SSH leaves this process.
+  if (input.via === "control") {
+    const ctl = resolveVmControl(input.target, target, process.env);
+    const transportStart = Date.now();
+    await callControl(ctl, "deploy", { name: input.extensionName, sha: artifactSourceCommit! });
+    const transportDurationMs = Date.now() - transportStart;
+    const verifiedCommit = await verifyMeta(target.base_url, input.extensionName, sourceCommit);
+    return {
+      extensionName: input.extensionName,
+      target: input.target,
+      sourceCommit,
+      buildDurationMs,
+      transportDurationMs,
+      verifiedCommit,
+      artifact,
     };
   }
 

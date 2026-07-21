@@ -313,10 +313,9 @@ no gsutil, no gcloud needed; credentials come from env by convention):
     directus-deploy apply --target test --entities collections,fields,relations,roles,policies,permissions,flows,operations,seeds
     (never auto-apply raw-SQL migrations to shared envs — use 'migrations lint' to check them)
 
-  Build + deploy ONE extension without SSH (publish uploads via GCS REST,
-  promote installs through the env's control function):
-    directus-deploy extensions push <name> --target test --publish
-    directus-deploy extensions promote <name> --target test --via control
+  Build + deploy ONE extension without SSH — one command (publishes the
+  artifact via GCS REST, installs through the env's control function, verifies /_meta):
+    directus-deploy extensions push <name> --target test --via control
 
   Verify what's actually running:
     directus-deploy extensions status --target test
@@ -1083,6 +1082,11 @@ extensionsGroup
   .option("--all", "push every extension (respects --targets-file)")
   .option("--skip-build", "skip 'npm run build' — assume dist/ is up to date")
   .option("--publish", "also publish an immutable artifact to gs://<artifact_bucket>/<name>/<sha>.tgz (build-once/promote-many)")
+  .option(
+    "--via <transport>",
+    "ssh (default): rsync/ssh directly to the VM. control: publish the artifact and install it through the target's control_url function — full deploy with no SSH egress (implies --publish)",
+    "ssh",
+  )
   .option("--allow-dirty", "permit publish from a dirty worktree (artifact won't be reproducible; never for prod)")
   .option("--force", "overwrite an existing artifact (breaks first-write-wins byte-identity — use with care)")
   .action(async (names: string[], opts: {
@@ -1092,9 +1096,14 @@ extensionsGroup
     all?: boolean;
     skipBuild?: boolean;
     publish?: boolean;
+    via: string;
     allowDirty?: boolean;
     force?: boolean;
   }) => {
+    if (!["ssh", "control"].includes(opts.via)) {
+      process.stderr.write(`unknown --via '${opts.via}' (ssh | control)\n`);
+      process.exit(2);
+    }
     const { pushExtension, shaMatch } = await import("./extensions.js");
     let list = names;
     if ((!list || list.length === 0) && opts.all) {
@@ -1118,7 +1127,8 @@ extensionsGroup
           targetsFile: opts.targetsFile,
           repoRoot: opts.repoRoot,
           skipBuild: Boolean(opts.skipBuild),
-          publish: Boolean(opts.publish),
+          publish: Boolean(opts.publish) || opts.via === "control", // control transport deploys from the bucket
+          via: opts.via as "ssh" | "control",
           allowDirty: Boolean(opts.allowDirty),
           force: Boolean(opts.force),
         });
