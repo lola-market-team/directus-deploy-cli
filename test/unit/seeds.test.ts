@@ -90,6 +90,22 @@ describe("reconcileSeeds PK resolution (#32)", () => {
     expect(client.post).not.toHaveBeenCalled();
   });
 
+  it("falls back to `id` when /fields returns null (403/404 from the real client)", async () => {
+    const seedDir = await writeSeedDir({
+      "messaging_templates.json": {
+        collection: "messaging_templates",
+        data: [{ id: 3, subject: "hi" }],
+      },
+    });
+    // No fieldsByCollection entry → the mock's /fields route returns null,
+    // mirroring http.ts get() on 403/404.
+    const client = mockClient();
+    const results = await reconcileSeeds({ seedDir, client, opts: { dryRun: false } });
+    expect(results).toEqual([
+      { kind: "seeds", label: "seeds/messaging_templates[3]", action: "created" },
+    ]);
+  });
+
   it("falls back to `id` when /fields is unavailable", async () => {
     const seedDir = await writeSeedDir({
       "messaging_templates.json": {

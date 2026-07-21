@@ -88,7 +88,11 @@ async function resolvePrimaryKey(client, collection, cache) {
     try {
         const raw = await client.get(`/fields/${collection}`);
         if (Array.isArray(raw)) {
-            const pkField = raw.find((f) => f.schema?.is_primary_key === true);
+            const pkField = raw.find((f) => {
+                // Some schema inspectors report 1 / "YES" instead of boolean true.
+                const v = f.schema?.is_primary_key;
+                return v === true || v === 1 || v === "YES";
+            });
             if (pkField && typeof pkField.field === "string")
                 pk = pkField.field;
         }
