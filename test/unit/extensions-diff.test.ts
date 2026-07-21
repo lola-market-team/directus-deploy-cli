@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { execSync } from "node:child_process";
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { renderDiff } from "../../src/extensions.js";
+import { diffExtensions, renderDiff } from "../../src/extensions.js";
 import type { DiffReport } from "../../src/extensions.js";
 
 async function scratchRepo(files: Record<string, string>): Promise<string> {
@@ -169,6 +170,66 @@ describe("renderDiff", () => {
     const out = renderDiff(report);
     expect(out).toMatch(/unshipped/);
     expect(out).toMatch(/not deployed anywhere/);
+  });
+});
+
+describe("diffExtensions with unresolvable deployed SHAs", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  async function gitFixture(): Promise<{ repoRoot: string; targetsFile: string; headSha: string }> {
+    const repoRoot = await mkdtemp(join(tmpdir(), "diff-git-"));
+    await mkdir(join(repoRoot, "extensions/chat/src"), { recursive: true });
+    await writeFile(join(repoRoot, "extensions/chat/package.json"), "{}", "utf8");
+    await writeFile(join(repoRoot, "extensions/chat/src/index.ts"), "export {}\n", "utf8");
+    const git = (cmd: string) => execSync(`git ${cmd}`, { cwd: repoRoot, encoding: "utf8" }).trim();
+    git("init -q");
+    git("-c user.email=t@t -c user.name=t commit -q --allow-empty -m root");
+    git("add .");
+    git("-c user.email=t@t -c user.name=t commit -q -m ext");
+    const headSha = git("rev-parse --short HEAD");
+    const targetsFile = join(repoRoot, "targets.json");
+    await writeFile(
+      targetsFile,
+      JSON.stringify({
+        targets: {
+          test: {
+            base_url: "http://localhost:1",
+            ssh_host: "unused",
+            ssh_user: "unused",
+            remote_extensions_path: "/unused",
+          },
+        },
+      }),
+      "utf8",
+    );
+    return { repoRoot, targetsFile, headSha };
+  }
+
+  it("reports an error cell — not drift — when the deployed commit isn't in local git", async () => {
+    const { repoRoot, targetsFile } = await gitFixture();
+    vi.stubGlobal("fetch", async () => ({
+      ok: true,
+      json: async () => ({ sourceCommit: "deadbeef" }),
+    }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "HEAD" });
+    const cell = report.rows[0]!.cells["test"]!;
+    expect(cell.error).toMatch(/not in local git/);
+    expect(cell.deployedTreeHash).toBeNull();
+    expect(cell.matchesReference).toBe(false);
+  });
+
+  it("matches when the deployed commit resolves to the reference tree", async () => {
+    const { repoRoot, targetsFile, headSha } = await gitFixture();
+    vi.stubGlobal("fetch", async () => ({
+      ok: true,
+      json: async () => ({ sourceCommit: headSha }),
+    }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "HEAD" });
+    const cell = report.rows[0]!.cells["test"]!;
+    expect(cell.error).toBeUndefined();
+    expect(cell.matchesReference).toBe(true);
   });
 });
 

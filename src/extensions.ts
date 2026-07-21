@@ -802,6 +802,27 @@ export async function diffExtensions(input: DiffInput): Promise<DiffReport> {
     return h;
   };
 
+  // Deployed stamps reference arbitrary history: a stale or shallow clone
+  // (sandboxed agents) can't resolve older SHAs, and squash-merges orphan
+  // branch SHAs outright. One recovery fetch per run repairs the first two
+  // cases; a SHA that still doesn't resolve becomes an error cell — never
+  // silent drift. Fetching by SHA directly is not an option: stamps are
+  // short SHAs and fetch wants require full 40-char ids.
+  let recoveryFetched = false;
+  const recoverMissingObjects = async (): Promise<void> => {
+    if (recoveryFetched) return;
+    recoveryFetched = true;
+    await runCommand("git", ["-C", input.repoRoot, "fetch", "--quiet", "origin"]);
+    const shallow = await runCommand("git", ["-C", input.repoRoot, "rev-parse", "--is-shallow-repository"]);
+    if (shallow.stdout.trim() === "true") {
+      await runCommand("git", ["-C", input.repoRoot, "fetch", "--quiet", "--unshallow", "origin"]);
+    }
+  };
+  const commitExists = async (sha: string): Promise<boolean> => {
+    const r = await runCommand("git", ["-C", input.repoRoot, "rev-parse", "--verify", "--quiet", `${sha}^{commit}`]);
+    return r.code === 0;
+  };
+
   const rows: DiffRow[] = [];
   for (const ext of names) {
     const referenceTreeHash = await cachedTreeHash(input.reference, ext);
@@ -830,6 +851,17 @@ export async function diffExtensions(input: DiffInput): Promise<DiffReport> {
 
       if (sourceCommit) {
         deployedTreeHash = await cachedTreeHash(sourceCommit, ext);
+        if (deployedTreeHash === null && !(await commitExists(sourceCommit))) {
+          await recoverMissingObjects();
+          if (await commitExists(sourceCommit)) {
+            treeHashCache.delete(`${sourceCommit}::extensions/${ext}/src`);
+            deployedTreeHash = await cachedTreeHash(sourceCommit, ext);
+          } else {
+            // Commit exists nowhere we can reach — likely squash-orphaned.
+            // "Can't verify" must not masquerade as "differs from ref".
+            error = `deployed commit ${sourceCommit} not in local git even after fetching origin (squash-orphaned?)`;
+          }
+        }
         if (deployedTreeHash && referenceTreeHash) {
           matchesReference = deployedTreeHash === referenceTreeHash;
         }
@@ -887,9 +919,9 @@ export function renderDiff(report: DiffReport): string {
     } else if (deployedCells.every((c) => c!.matchesReference)) {
       state = `matches ${report.reference}`;
     } else if (deployedCells.some((c) => c!.deployedTreeHash == null)) {
-      // Fetch first, then compare — some SHAs aren't local yet.
+      // Auto-fetch already ran — what's left is unreachable from any ref.
       const missing = deployedCells.filter((c) => c!.deployedTreeHash == null).length;
-      state = `${missing} deployed SHA(s) not in local git — try 'git fetch --all'`;
+      state = `${missing} deployed SHA(s) not in local git (squash-orphaned?) — can't verify`;
     } else {
       // Which targets differ from reference? Note the branch hint per target.
       const off = report.targets

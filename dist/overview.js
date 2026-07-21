@@ -431,7 +431,7 @@ export function renderOverview(report) {
             for (const d of t.extensions.driftList)
                 details.push(`✗ ${t.target} extension ${d.name} differs from ${t.ref ?? "HEAD"}${d.hint ? ` — running ${d.hint}` : ""}`);
             if (t.extensions.missingList.length)
-                details.push(`? ${t.target} extensions unreachable: ${t.extensions.missingList.join(", ")}`);
+                details.push(`? ${t.target} extensions uncheckable (no _meta, or deployed commit not in local git): ${t.extensions.missingList.join(", ")}`);
         }
         if (isErr(t.config))
             details.push(`⚠ ${t.target} config: ${t.config.error}`);
