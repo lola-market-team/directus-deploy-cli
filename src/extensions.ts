@@ -21,21 +21,14 @@ import { join, resolve } from "node:path";
 //
 // Config is a JSON file (see TargetsFile). One file per repo, checked in.
 
-export interface TargetsFile {
-  targets: Record<string, TargetConfig>;
-}
-
-export interface TargetConfig {
-  base_url: string;                // https://test.lola.market — for /_meta verify
-  ssh_host: string;                // hostname/IP the SSH client resolves
-  ssh_user: string;                // the user on the VM (typically "runner")
-  remote_extensions_path: string;  // e.g. /opt/directus/extensions
-  ssh_key_env?: string;            // env var holding path to private key (defaults to $LOLA_EXT_SSH_KEY)
-  artifact_bucket?: string;        // gs:// URI for build-once/promote-many artifacts (default: gs://lola-market-extensions)
-  build_forbidden?: boolean;       // set true for prod-like targets: `promote` refuses when the artifact is missing instead of building
-  ref?: string;                    // git ref this env is deployed from (e.g. "origin/develop") — used by `overview`
-  token_env?: string;              // env var holding the admin token (default: DIRECTUS_<UPPER>_TOKEN)
-}
+import { loadTargets } from "./targets.js";
+import type { TargetConfig, TargetsFile } from "./targets.js";
+// Re-export so existing importers (cli, overview, mcp-server) keep working.
+export { loadTargets } from "./targets.js";
+export type { TargetConfig, TargetsFile } from "./targets.js";
+import { callControl, resolveInvokerKey, resolveVmControl } from "./vm.js";
+import { gcsDownload, gcsObjectExists, gcsUpload, mintGcsToken, parseGsUri } from "./gcloud.js";
+import type { InvokerKey } from "./gcloud.js";
 
 const DEFAULT_ARTIFACT_BUCKET = "gs://lola-market-extensions";
 
@@ -63,15 +56,6 @@ export interface PushResult {
     alreadyPublished: boolean;
     uploadDurationMs: number;
   };
-}
-
-export async function loadTargets(path: string): Promise<TargetsFile> {
-  const raw = await readFile(path, "utf8");
-  const parsed = JSON.parse(raw) as TargetsFile;
-  if (!parsed?.targets || typeof parsed.targets !== "object") {
-    throw new Error(`invalid targets file at ${path}: missing 'targets' object`);
-  }
-  return parsed;
 }
 
 function runCommand(
@@ -295,6 +279,7 @@ export async function pushExtension(input: PushInput): Promise<PushResult> {
       bucket,
       sourceCommit: artifactSourceCommit!,
       force: Boolean(input.force),
+      gcsKey: resolveInvokerKey(input.target, target, process.env),
     });
     artifact = {
       uri: r.artifactUri,
@@ -415,6 +400,15 @@ async function gsutilStatExists(uri: string): Promise<boolean> {
   return r.code === 0;
 }
 
+async function gsutilAvailable(): Promise<boolean> {
+  try {
+    const r = await runCommand("gsutil", ["version"]);
+    return r.code === 0;
+  } catch {
+    return false; // spawn ENOENT — binary not installed (agent sandboxes)
+  }
+}
+
 async function publishTarball(input: {
   repoRoot: string;
   extName: string;
@@ -422,16 +416,40 @@ async function publishTarball(input: {
   bucket: string;
   sourceCommit: string;
   force: boolean;
+  gcsKey?: InvokerKey; // REST fallback when gsutil is unavailable (agent sandboxes)
 }): Promise<{ artifactUri: string; sha256: string; alreadyPublished: boolean }> {
-  const { repoRoot, extName, extDir, bucket, sourceCommit, force } = input;
+  const { repoRoot, extName, extDir, bucket, sourceCommit, force, gcsKey } = input;
   const artifactUri = `${bucket}/${extName}/${sourceCommit}.tgz`;
 
-  if (!force && (await gsutilStatExists(artifactUri))) {
+  const viaGsutil = await gsutilAvailable();
+  let gcsToken: string | undefined;
+  let bucketName = "";
+  if (!viaGsutil) {
+    if (!gcsKey) {
+      throw new Error(
+        "cannot publish: gsutil is not installed and no invoker SA key is available (set DIRECTUS_<TARGET>_INVOKER_KEY_B64 with storage access)",
+      );
+    }
+    gcsToken = await mintGcsToken(gcsKey);
+    bucketName = parseGsUri(bucket).bucket;
+  }
+  const objectName = `${extName}/${sourceCommit}.tgz`;
+
+  const exists = viaGsutil
+    ? await gsutilStatExists(artifactUri)
+    : await gcsObjectExists(bucketName, objectName, gcsToken!);
+  if (!force && exists) {
     // First-write-wins. The existing artifact is authoritative: rebuild + reupload
     // would break the byte-identity guarantee across envs.
     // Best-effort sha lookup from the sidecar; empty string if missing.
-    const r = await runCommand("gsutil", ["cat", `${artifactUri}.sha256`]);
-    const sha = r.code === 0 ? (r.stdout.trim().split(/\s+/)[0] ?? "") : "";
+    let sha = "";
+    if (viaGsutil) {
+      const r = await runCommand("gsutil", ["cat", `${artifactUri}.sha256`]);
+      sha = r.code === 0 ? (r.stdout.trim().split(/\s+/)[0] ?? "") : "";
+    } else {
+      const sidecar = await gcsDownload(bucketName, `${objectName}.sha256`, gcsToken!);
+      sha = sidecar ? (sidecar.toString("utf8").trim().split(/\s+/)[0] ?? "") : "";
+    }
     return { artifactUri, sha256: sha, alreadyPublished: true };
   }
 
@@ -467,12 +485,18 @@ async function publishTarball(input: {
   // Upload atomically-adjacent (tarball first, sha256 second). Race window:
   // a promoter reading between the two uploads gets the tarball without the
   // sidecar — promote code tolerates missing sha256 (best-effort verify).
-  await assertCommand("gsutil", ["-q", "cp", tarball, artifactUri], {
-    label: `gsutil cp → ${artifactUri}`,
-  });
-  await assertCommand("gsutil", ["-q", "cp", shaFile, `${artifactUri}.sha256`], {
-    label: `gsutil cp → ${artifactUri}.sha256`,
-  });
+  if (viaGsutil) {
+    await assertCommand("gsutil", ["-q", "cp", tarball, artifactUri], {
+      label: `gsutil cp → ${artifactUri}`,
+    });
+    await assertCommand("gsutil", ["-q", "cp", shaFile, `${artifactUri}.sha256`], {
+      label: `gsutil cp → ${artifactUri}.sha256`,
+    });
+  } else {
+    const { readFile: read } = await import("node:fs/promises");
+    await gcsUpload(bucketName, objectName, await read(tarball), gcsToken!, "application/gzip");
+    await gcsUpload(bucketName, `${objectName}.sha256`, await read(shaFile), gcsToken!, "text/plain");
+  }
 
   return { artifactUri, sha256: sha, alreadyPublished: false };
 }
@@ -482,7 +506,8 @@ export interface PromoteInput {
   target: string;
   targetsFile: string;
   repoRoot: string;
-  sourceCommit?: string;  // override the resolved short-sha (defaults to current source)
+  sourceCommit?: string;  // override the resolved short-sha (promote a specific historical artifact)
+  via?: "ssh" | "control"; // transport: direct SSH (default) or the target's control_url function
 }
 
 export interface PromoteResult {
@@ -510,6 +535,35 @@ export async function promoteExtension(input: PromoteInput): Promise<PromoteResu
     input.sourceCommit ?? (await resolveArtifactSourceCommit(repoRoot, input.extensionName));
   const bucket = targetArtifactBucket(target);
   const artifactUri = `${bucket}/${input.extensionName}/${sourceCommit}.tgz`;
+
+  // Control transport: the target's vm-control function runs the identical
+  // install script over SSH from inside GCP. Used where the caller has no
+  // SSH egress (agent sandboxes). Artifact existence is verified via GCS REST
+  // when an invoker key is available; the remote install re-verifies sha256.
+  if (input.via === "control") {
+    const ctl = resolveVmControl(input.target, target, process.env);
+    if (ctl.invokerKey) {
+      const token = await mintGcsToken(ctl.invokerKey);
+      const { bucket: bucketName } = parseGsUri(bucket);
+      if (!(await gcsObjectExists(bucketName, `${input.extensionName}/${sourceCommit}.tgz`, token))) {
+        throw new Error(
+          `no artifact at ${artifactUri} — publish first: directus-deploy extensions push ${input.extensionName} --target <build-env> --publish`,
+        );
+      }
+    }
+    const transportStart = Date.now();
+    await callControl(ctl, "deploy", { name: input.extensionName, sha: sourceCommit });
+    const transportDurationMs = Date.now() - transportStart;
+    const verifiedCommit = await verifyMeta(target.base_url, input.extensionName, sourceCommit);
+    return {
+      extensionName: input.extensionName,
+      target: input.target,
+      sourceCommit,
+      artifactUri,
+      transportDurationMs,
+      verifiedCommit,
+    };
+  }
 
   if (!(await gsutilStatExists(artifactUri))) {
     // Prod-like targets never build — the artifact must already exist,

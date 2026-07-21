@@ -48,6 +48,10 @@ Each target declares its branch in the targets file (`"ref": "origin/develop"`);
 
 Exit codes: `0` in sync, `1` drift, `2` a check could not run. `--json` emits the full report (untruncated detail lists) for dashboards or Slack bots.
 
+## VM control
+
+For environments whose VM sleeps when idle: `directus-deploy vm status|start|stop --target <name>`. `start` is an instant no-op when `<base_url>/server/health` already answers, otherwise dispatches the wake and polls until healthy. Backed by a tiny token-gated cloud function (one per instance — see `cloudfunctions/vm-control/` for the 5-minute deploy); the target declares `control_url` in the targets file and the token comes from `DIRECTUS_<TARGET>_CONTROL_TOKEN`. Callers never hold GCP credentials.
+
 ## MCP server
 
 Ships an MCP server exposing the reconciler as structured tools:

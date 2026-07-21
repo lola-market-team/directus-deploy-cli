@@ -504,6 +504,32 @@ program
         process.exit(2);
     process.exit(0);
 });
+// vm: start/stop/status of a target's VM via its token-gated control endpoint
+// (deploy cloudfunctions/vm-control once per controllable instance). Lets
+// agents and laptops wake a sleeping test box without GitHub Actions or GCP
+// credentials. `start` waits until <base_url>/server/health answers.
+program
+    .command("vm")
+    .description("Control a target's VM through its control_url endpoint: status | start | stop. `start` polls /server/health until healthy. Requires control_url in the targets file + DIRECTUS_<TARGET>_CONTROL_TOKEN in env.")
+    .argument("<action>", "status | start | stop")
+    .requiredOption("--target <name>", "target name from the targets file")
+    .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
+    .option("--wait-timeout <seconds>", "start: how long to wait for health", "300")
+    .option("--json", "emit JSON")
+    .action(async (action, opts) => {
+    if (!["status", "start", "stop"].includes(action)) {
+        process.stderr.write(`unknown action '${action}' (status | start | stop)\n`);
+        process.exit(2);
+    }
+    const { runVm } = await import("./vm.js");
+    process.exit(await runVm({
+        action: action,
+        target: opts.target,
+        targetsFile: opts.targetsFile,
+        waitTimeoutMs: Number(opts.waitTimeout) * 1000,
+        json: Boolean(opts.json),
+    }));
+});
 // migrations adopt: bootstrap the tracker on an env whose migrations were
 // applied via some prior mechanism. Inserts (filename, sha256) rows without
 // executing any SQL. Idempotent — re-adopting is a no-op when hashes match.
@@ -862,7 +888,12 @@ extensionsGroup
     .option("--repo-root <path>", "repo root (default: cwd)", process.cwd())
     .option("--all", "promote every extension under ./extensions")
     .option("--source-commit <sha>", "override the resolved short-sha (promote a specific historical artifact)")
+    .option("--via <transport>", "ssh (default): rsync/ssh directly to the VM. control: deploy through the target's control_url function — for callers without SSH egress (agent sandboxes)", "ssh")
     .action(async (names, opts) => {
+    if (!["ssh", "control"].includes(opts.via)) {
+        process.stderr.write(`unknown --via '${opts.via}' (ssh | control)\n`);
+        process.exit(2);
+    }
     const { promoteExtension, shaMatch } = await import("./extensions.js");
     let list = names;
     if ((!list || list.length === 0) && opts.all) {
@@ -890,6 +921,7 @@ extensionsGroup
                 targetsFile: opts.targetsFile,
                 repoRoot: opts.repoRoot,
                 sourceCommit: opts.sourceCommit,
+                via: opts.via,
             });
             const verify = r.verifiedCommit
                 ? shaMatch(r.verifiedCommit, r.sourceCommit)

@@ -1,0 +1,12 @@
+{
+  "name": "vm-control",
+  "private": true,
+  "description": "Token-gated control endpoint for one environment: GCE start/stop/status + extension artifact deploy. Companion to `directus-deploy vm` and `extensions promote --via control`.",
+  "main": "index.js",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@google-cloud/compute": "^4.7.0",
+    "@google-cloud/secret-manager": "^5.6.0",
+    "ssh2": "^1.16.0"
+  }
+}
