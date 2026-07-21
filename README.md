@@ -48,6 +48,22 @@ Each target declares its branch in the targets file (`"ref": "origin/develop"`);
 
 Exit codes: `0` in sync, `1` drift, `2` a check could not run. `--json` emits the full report (untruncated detail lists) for dashboards or Slack bots.
 
+## Extension deploy model
+
+One rule: **new builds enter only at test; staging and prod replay the archive.**
+
+- `extensions push <n> --target test` — builds and deploys. With `--publish` (implied by
+  `--via control`) the tarball is ALSO archived to `gs://<artifact_bucket>/<n>/<sha>.tgz`
+  (immutable, first-write-wins) — that archive is what makes the build promotable.
+- `extensions promote <n> --target staging|prod` — installs the archived artifact for the
+  sha of the current checkout. Never builds; refuses if the artifact is missing. This is
+  the only path to prod (`build_forbidden`).
+- Transports: `--via ssh` (default; needs ssh/rsync + port-22 egress) or `--via control`
+  (HTTPS-only, through the target's `control_url` function — for sandboxes/agents).
+
+So a test deploy is two uploads of one tarball: bucket (archive, for later promotes) and
+target (install). Deploys above test are one download (bucket) + one install.
+
 ## VM control
 
 For environments whose VM sleeps when idle: `directus-deploy vm status|start|stop --target <name>`. `start` is an instant no-op when `<base_url>/server/health` already answers, otherwise dispatches the wake and polls until healthy. Backed by a tiny token-gated cloud function (one per instance — see `cloudfunctions/vm-control/` for the 5-minute deploy); the target declares `control_url` in the targets file and the token comes from `DIRECTUS_<TARGET>_CONTROL_TOKEN`. Callers never hold GCP credentials.

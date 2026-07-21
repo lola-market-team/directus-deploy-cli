@@ -252,9 +252,12 @@ no gsutil, no gcloud needed; credentials come from env by convention):
     directus-deploy apply --target test --entities collections,fields,relations,roles,policies,permissions,flows,operations,seeds
     (never auto-apply raw-SQL migrations to shared envs — use 'migrations lint' to check them)
 
-  Build + deploy ONE extension without SSH — one command (publishes the
-  artifact via GCS REST, installs through the env's control function, verifies /_meta):
-    directus-deploy extensions push <name> --target test --via control
+  EXTENSION DEPLOY MODEL — one rule: new builds enter ONLY at test; staging/prod
+  replay the archived artifact (byte-identical, sha-named, first-write-wins):
+    build+deploy to test (also archives to the bucket; no SSH):
+      directus-deploy extensions push <name> --target test --via control
+    put the SAME tested build on staging/prod (never rebuilds; refuses if unarchived):
+      directus-deploy extensions promote <name> --target staging   # checkout picks the sha
 
   Verify what's actually running:
     directus-deploy extensions status --target test
@@ -792,7 +795,7 @@ const extensionsGroup = program
     .description("Extension deploy over plain SSH (no gcloud, no service account)");
 extensionsGroup
     .command("push")
-    .description("Build extensions/<name> locally and rsync to the target VM. Atomically swaps dist/ so EXTENSIONS_AUTO_RELOAD picks it up, then verifies /<name>/_meta.")
+    .description("Build extensions/<name> and DEPLOY it to the target. Deploying is two uploads of one tarball: (1) --publish archives it to the artifact bucket under its source-sha — this is what makes the build promotable to staging/prod later; (2) the install itself. Transport: --via ssh (default; rsync + atomic swap) or --via control (no SSH: publish + install through the target's control function; implies --publish). Always verifies /<name>/_meta afterwards. New code enters ONLY via push to test; higher envs receive the archived artifact via `promote`.")
     .argument("[names...]", "extensions to push (default: --all)")
     .requiredOption("--target <env>", "target env name from the targets file")
     .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
@@ -912,7 +915,7 @@ extensionsGroup
 });
 extensionsGroup
     .command("promote")
-    .description("Promote a pre-published artifact from gs://<artifact_bucket>/<name>/<sha>.tgz to the target VM. Never builds — the artifact for the current source commit MUST already exist (publish first via `push --publish` on a lower env). Byte-identical to what ran on that lower env.")
+    .description("Install a PRE-PUBLISHED artifact (gs://<artifact_bucket>/<name>/<sha>.tgz) on the target — byte-identical to what was validated on a lower env. Never builds; refuses when the artifact is missing (then: push --publish on test first). The sha is resolved from the CURRENT CHECKOUT, so check out the commit you mean (origin/develop → staging, origin/master → prod). Transport: --via ssh (default) or --via control (no SSH; through the target's control function). This is THE way anything reaches staging/prod: test is the only door for new bytes, everything above replays the archive.")
     .argument("[names...]", "extensions to promote (default: --all)")
     .requiredOption("--target <env>", "target env name from the targets file (e.g. prod)")
     .option("--targets-file <path>", "path to targets JSON", "./directus-deploy.targets.json")
