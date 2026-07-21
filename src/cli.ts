@@ -288,12 +288,15 @@ async function fetchUnknownFields(
 }
 
 const program = new Command();
+const pkg = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+) as { version: string };
 program
   .name("directus-deploy")
   .description(
     "Reconcile a Directus environment to the state described in directus_config/snapshot/. Per-entity, non-atomic.",
   )
-  .version("0.8.0");
+  .version(pkg.version);
 
 function attachCommon(cmd: Command): Command {
   return cmd
@@ -599,6 +602,52 @@ program
 
     if (migUnreachable) process.exit(2);
     if (migPending + migMutated + extDrift + cfgChangeCount > 0) process.exit(1);
+    process.exit(0);
+  });
+
+// overview: the full deployment matrix in one command — every target compared
+// against the git ref it deploys from (targets file `ref` field), plus a
+// promotion-queue column (develop → master). Exit 1 on drift, 2 when a check
+// could not run, 0 when everything is in sync. The promotion column is
+// informational and never affects the exit code.
+program
+  .command("overview")
+  .description(
+    "Deployment matrix: each target vs its `ref` (from the targets file) across migrations/extensions/config/seeds, plus the promotion queue between refs. Assumes the canonical repo layout (directus_config/, migrations/, extensions/).",
+  )
+  .option(
+    "--targets-file <path>",
+    "path to targets JSON",
+    "./directus-deploy.targets.json",
+  )
+  .option("--targets <csv>", "restrict to these targets (default: every target in the file)")
+  .option("--repo-root <path>", "repo root (default: cwd)", process.cwd())
+  .option("--from <ref>", "promotion queue source ref (default: inferred from target refs)")
+  .option("--to <ref>", "promotion queue destination ref (default: inferred from target refs)")
+  .option("--json", "emit JSON report instead of the matrix")
+  .action(async (opts: {
+    targetsFile: string;
+    targets?: string;
+    repoRoot: string;
+    from?: string;
+    to?: string;
+    json?: boolean;
+  }) => {
+    const { runOverview, renderOverview, hasDrift, hasErrors } = await import("./overview.js");
+    const report = await runOverview({
+      targetsFile: opts.targetsFile,
+      repoRoot: opts.repoRoot,
+      targets: opts.targets ? opts.targets.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
+      from: opts.from,
+      to: opts.to,
+    });
+    if (opts.json) {
+      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+    } else {
+      process.stdout.write(renderOverview(report) + "\n");
+    }
+    if (hasDrift(report)) process.exit(1);
+    if (hasErrors(report)) process.exit(2);
     process.exit(0);
   });
 

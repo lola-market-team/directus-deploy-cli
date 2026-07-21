@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 const DEFAULT_ARTIFACT_BUCKET = "gs://lola-market-extensions";
-async function loadTargets(path) {
+export async function loadTargets(path) {
     const raw = await readFile(path, "utf8");
     const parsed = JSON.parse(raw);
     if (!parsed?.targets || typeof parsed.targets !== "object") {

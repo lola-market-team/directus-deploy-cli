@@ -33,6 +33,8 @@ export interface TargetConfig {
   ssh_key_env?: string;            // env var holding path to private key (defaults to $LOLA_EXT_SSH_KEY)
   artifact_bucket?: string;        // gs:// URI for build-once/promote-many artifacts (default: gs://lola-market-extensions)
   build_forbidden?: boolean;       // set true for prod-like targets: `promote` refuses when the artifact is missing instead of building
+  ref?: string;                    // git ref this env is deployed from (e.g. "origin/develop") — used by `overview`
+  token_env?: string;              // env var holding the admin token (default: DIRECTUS_<UPPER>_TOKEN)
 }
 
 const DEFAULT_ARTIFACT_BUCKET = "gs://lola-market-extensions";
@@ -63,7 +65,7 @@ export interface PushResult {
   };
 }
 
-async function loadTargets(path: string): Promise<TargetsFile> {
+export async function loadTargets(path: string): Promise<TargetsFile> {
   const raw = await readFile(path, "utf8");
   const parsed = JSON.parse(raw) as TargetsFile;
   if (!parsed?.targets || typeof parsed.targets !== "object") {
