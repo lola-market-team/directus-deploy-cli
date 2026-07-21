@@ -13,8 +13,11 @@ import { diffSubset, formatDiffPath } from "../diff.js";
 //     "data": [ {"id": 3, "_sync_id": "3", ...}, ... ]
 //   }
 //
-// Identity is `id` — Directus's real primary key. `_sync_id` is Tractr's own
-// namespace and gets stripped before writes. Additive-only in v0: `delete` is
+// Row identity is the collection's real primary key, resolved per collection
+// from /fields/<collection> (schema.is_primary_key) and falling back to `id`
+// when unresolvable (#32 — `notification_types` keys on `key`, not `id`).
+// `_sync_id` is Tractr's own namespace and gets stripped before writes.
+// Additive-only in v0: `delete` is
 // honoured for the read side (server extras aren't flagged as drift) but
 // nothing is DELETEd. If you need to remove a seed row, delete it from git
 // AND from the server manually until we add a `--prune` flag.
@@ -85,15 +88,44 @@ async function listServer(
   return Array.isArray(data) ? (data as Record<string, unknown>[]) : [];
 }
 
-function indexById(
+function indexByPk(
   rows: Record<string, unknown>[],
+  pk: string,
 ): Map<string, Record<string, unknown>> {
   const map = new Map<string, Record<string, unknown>>();
   for (const r of rows) {
-    const id = (r as { id?: unknown }).id;
-    if (id !== undefined && id !== null) map.set(String(id), r);
+    const v = r[pk];
+    if (v !== undefined && v !== null) map.set(String(v), r);
   }
   return map;
+}
+
+// PK per collection via /fields/<collection>. Falls back to `id` when the
+// endpoint is unreachable or reports no PK — never throws, so a lookup
+// hiccup degrades to the historical behaviour instead of failing the file.
+async function resolvePrimaryKey(
+  client: DirectusClient,
+  collection: string,
+  cache: Map<string, string>,
+): Promise<string> {
+  const hit = cache.get(collection);
+  if (hit !== undefined) return hit;
+  let pk = "id";
+  try {
+    const raw = await client.get(`/fields/${collection}`);
+    if (Array.isArray(raw)) {
+      const pkField = raw.find((f) => {
+        // Some schema inspectors report 1 / "YES" instead of boolean true.
+        const v = (f.schema as { is_primary_key?: unknown } | null | undefined)?.is_primary_key;
+        return v === true || v === 1 || v === "YES";
+      });
+      if (pkField && typeof pkField.field === "string") pk = pkField.field;
+    }
+  } catch {
+    // fall back to `id`
+  }
+  cache.set(collection, pk);
+  return pk;
 }
 
 export async function reconcileSeeds(input: SeedReconcileInput): Promise<EntityResult[]> {
@@ -101,8 +133,11 @@ export async function reconcileSeeds(input: SeedReconcileInput): Promise<EntityR
   const files = await readSeedFiles(input.seedDir);
   if (files.length === 0) return results;
 
+  const pkCache = new Map<string, string>();
+
   for (const file of files) {
     const { collection } = file;
+    const pk = await resolvePrimaryKey(input.client, collection, pkCache);
     const create = file.meta?.create !== false;
     const update = file.meta?.update !== false;
 
@@ -118,14 +153,24 @@ export async function reconcileSeeds(input: SeedReconcileInput): Promise<EntityR
       });
       continue;
     }
-    const byId = indexById(server);
+    const byPk = indexByPk(server, pk);
 
-    for (const rawRow of file.data ?? []) {
-      const id = (rawRow as { id?: unknown }).id;
-      if (id === undefined || id === null) continue;
+    for (const [i, rawRow] of (file.data ?? []).entries()) {
+      const id = rawRow[pk];
+      if (id === undefined || id === null) {
+        // #32: never skip silently — an invisible row is indistinguishable
+        // from "nothing to do" in plan/apply output.
+        results.push({
+          kind: "seeds",
+          label: `seeds/${collection}[row ${i}]`,
+          action: "skipped",
+          reason: `row has no value for primary key '${pk}'`,
+        });
+        continue;
+      }
       const label = `seeds/${collection}[${String(id)}]`;
       const payload = sanitizeSeedRow(rawRow);
-      const existing = byId.get(String(id));
+      const existing = byPk.get(String(id));
 
       if (existing === undefined) {
         if (!create) {
