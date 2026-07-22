@@ -306,15 +306,40 @@ export async function pushExtension(input: PushInput): Promise<PushResult> {
     );
     const transportStart = Date.now();
     const url = `${target.base_url.replace(/\/+$/, "")}/ext-deploy/`;
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: input.extensionName,
-        sha256,
-        tarball: (await read(tarball)).toString("base64"),
-      }),
-    });
+    // The endpoint writes files BEFORE replying, and the extension hot-reload
+    // it triggers can kill the connection mid-response (observed as a gateway
+    // 502, or a dropped socket). So a failed response doesn't mean a failed
+    // deploy — for those cases, probe /_meta for the expected commit before
+    // declaring failure.
+    let r: Response | null = null;
+    try {
+      r = await fetch(url, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: input.extensionName,
+          sha256,
+          tarball: (await read(tarball)).toString("base64"),
+        }),
+      });
+    } catch {
+      r = null;
+    }
+    if (r === null || r.status === 502 || r.status === 503) {
+      const probed = await verifyMeta(target.base_url, input.extensionName, sourceCommit);
+      if (probed && shaMatch(probed, sourceCommit)) {
+        return {
+          extensionName: input.extensionName,
+          target: input.target,
+          sourceCommit,
+          buildDurationMs,
+          transportDurationMs: Date.now() - transportStart,
+          verifiedCommit: probed,
+          artifact,
+        };
+      }
+      if (r === null) throw new Error(`ext-deploy POST failed: connection dropped and /_meta does not report ${sourceCommit.slice(0, 12)}`);
+    }
     if (!r.ok) {
       const body = await r.text().catch(() => "");
       // Two distinct 404s: Directus's router 404 ("Route ... doesn't exist")

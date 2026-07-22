@@ -108,6 +108,41 @@ describe("pushExtension --via api contract", () => {
     expect(body.tarball.length).toBeGreaterThan(0);
     expect(result.verifiedCommit).toBe(sha);
   });
+
+  // The endpoint writes files before replying and the hot-reload it triggers
+  // can drop the connection — a 502 with /_meta reporting the new commit is a
+  // successful deploy, not a failure.
+  it("treats a 502 as success when /_meta reports the expected commit", async () => {
+    const root = await scratchRepo({
+      "extensions/chat/package.json": JSON.stringify({ name: "chat", version: "1.0.0" }),
+      "extensions/chat/src/index.ts": "export {};",
+      "extensions/chat/dist/index.js": "export default {};",
+      "directus-deploy.targets.json": JSON.stringify({
+        targets: { test: { base_url: "https://cms.example", ssh_host: "y", ssh_user: "runner", remote_extensions_path: "/opt" } },
+      }),
+    });
+    const git = (...args: string[]) => execFileSync("git", ["-C", root, ...args]);
+    git("init", "-q");
+    git("add", ".");
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "chat");
+    const sha = execFileSync("git", ["-C", root, "rev-parse", "HEAD"]).toString().trim();
+
+    vi.stubEnv("DIRECTUS_TEST_TOKEN", "tok-123");
+    vi.stubGlobal("fetch", async (url: string | URL, init?: RequestInit) => {
+      if (init?.method === "POST") return new Response("Bad Gateway", { status: 502 });
+      return new Response(JSON.stringify({ sourceCommit: sha }), { status: 200 });
+    });
+
+    const result = await pushExtension({
+      extensionName: "chat",
+      target: "test",
+      targetsFile: `${root}/directus-deploy.targets.json`,
+      repoRoot: root,
+      skipBuild: true,
+      via: "api",
+    });
+    expect(result.verifiedCommit).toBe(sha);
+  });
 });
 
 describe("promoteExtension errors", () => {

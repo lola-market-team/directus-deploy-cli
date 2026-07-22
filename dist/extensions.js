@@ -229,16 +229,26 @@ export async function pushExtension(input) {
         const { readFile: read } = await import("node:fs/promises");
         const { tarball, sha256 } = await createArtifactTarball(input.extensionName, extDir, (artifactSourceCommit ?? sourceCommit).slice(0, 12));
         const transportStart = Date.now();
-        const url = `${target.base_url.replace(/\/+$/, "")}/ext-deploy/${input.extensionName}`;
+        const url = `${target.base_url.replace(/\/+$/, "")}/ext-deploy/`;
         const r = await fetch(url, {
             method: "POST",
             headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ sha256, tarball: (await read(tarball)).toString("base64") }),
+            body: JSON.stringify({
+                name: input.extensionName,
+                sha256,
+                tarball: (await read(tarball)).toString("base64"),
+            }),
         });
         if (!r.ok) {
             const body = await r.text().catch(() => "");
+            // Two distinct 404s: Directus's router 404 ("Route ... doesn't exist")
+            // means the request never reached ext-deploy (endpoint not installed,
+            // or a URL-shape mismatch — the 0.21.0–0.22.2 bug); the endpoint's own
+            // {"error":"not found"} means it ran but no deploy mode is enabled.
             const hint = r.status === 404
-                ? " (ext-deploy not enabled on this target? body mode requires EXT_DEPLOY_MODE=body)"
+                ? /doesn't exist/i.test(body)
+                    ? " (Directus router 404 — ext-deploy extension not installed on target, or CLI/server URL mismatch)"
+                    : " (ext-deploy is installed but disabled: body mode requires EXT_DEPLOY_MODE=body on the target)"
                 : r.status === 403
                     ? " (token is not admin)"
                     : "";
