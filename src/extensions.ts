@@ -957,27 +957,47 @@ export async function diffExtensions(input: DiffInput): Promise<DiffReport> {
     return r.code === 0;
   };
 
+  // Prefetch every /_meta probe in parallel with a short abort. It's a static
+  // JSON file behind nginx — 3s is generous when the target is up, and a
+  // black-holed host (sleeping test VM) would otherwise cost undici's 10s
+  // connect timeout PER extension, sequentially: ~4 minutes for 23 exts.
+  const META_TIMEOUT_MS = 3000;
+  const metaCache = new Map<string, { sourceCommit: string | null; error?: string }>();
+  await Promise.all(
+    names.flatMap((ext) =>
+      targetNames.map(async (targetName) => {
+        const target = cfg.targets[targetName]!;
+        const url = `${target.base_url.replace(/\/+$/, "")}/${ext}/_meta`;
+        let sourceCommit: string | null = null;
+        let error: string | undefined;
+        try {
+          const r = await fetch(url, { signal: AbortSignal.timeout(META_TIMEOUT_MS) });
+          if (r.ok) {
+            const body = (await r.json()) as { sourceCommit?: unknown };
+            if (typeof body?.sourceCommit === "string") sourceCommit = body.sourceCommit;
+          } else {
+            error = `HTTP ${r.status}`;
+          }
+        } catch (e) {
+          error =
+            (e as Error).name === "TimeoutError"
+              ? `/_meta timeout after ${META_TIMEOUT_MS}ms (target down?)`
+              : (e as Error).message;
+        }
+        metaCache.set(`${targetName}::${ext}`, { sourceCommit, error });
+      }),
+    ),
+  );
+
   const rows: DiffRow[] = [];
   for (const ext of names) {
     const referenceTreeHash = await cachedTreeHash(input.reference, ext);
     const row: DiffRow = { extension: ext, referenceTreeHash, cells: {} };
 
     for (const targetName of targetNames) {
-      const target = cfg.targets[targetName]!;
-      const url = `${target.base_url.replace(/\/+$/, "")}/${ext}/_meta`;
-      let sourceCommit: string | null = null;
-      let error: string | undefined;
-      try {
-        const r = await fetch(url);
-        if (r.ok) {
-          const body = (await r.json()) as { sourceCommit?: unknown };
-          if (typeof body?.sourceCommit === "string") sourceCommit = body.sourceCommit;
-        } else {
-          error = `HTTP ${r.status}`;
-        }
-      } catch (e) {
-        error = (e as Error).message;
-      }
+      const meta = metaCache.get(`${targetName}::${ext}`)!;
+      const sourceCommit = meta.sourceCommit;
+      let error = meta.error;
 
       let deployedTreeHash: string | null = null;
       let matchesReference = false;
