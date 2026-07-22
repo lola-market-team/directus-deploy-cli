@@ -20,6 +20,7 @@ export interface TargetConfig {
   control_url?: string;            // vm-control endpoint (cloudfunctions/vm-control) — used by `vm start|stop|status` and `promote --via control`
   control_token_env?: string;      // env var holding the control token (default: DIRECTUS_<UPPER>_CONTROL_TOKEN)
   control_invoker_key_env?: string; // env var holding a base64 SA key with run.invoker on the control fn, for orgs that forbid public endpoints (default: DIRECTUS_<UPPER>_INVOKER_KEY_B64)
+  control_key_env?: string;        // env var holding a plain API key when control_url is an API Gateway URL (x-api-key header; default: DIRECTUS_<UPPER>_CONTROL_KEY). Takes precedence over the invoker key — no JWT minting needed.
 }
 
 // Admin token for a target, by convention: token_env field, else

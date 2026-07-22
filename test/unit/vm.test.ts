@@ -36,6 +36,17 @@ describe("resolveVmControl", () => {
     ).toThrow(/DIRECTUS_PROD_CONTROL_TOKEN.*DIRECTUS_PROD_INVOKER_KEY_B64/);
   });
 
+  it("resolves an API Gateway key and it wins as the preferred transport", () => {
+    const ctl = resolveVmControl(
+      "test",
+      { ...base, control_url: "https://gw.example.dev/control" },
+      { DIRECTUS_TEST_CONTROL_KEY: "AIzaSyFake" },
+    );
+    expect(ctl.apiKey).toBe("AIzaSyFake");
+    expect(ctl.token).toBeUndefined();
+    expect(ctl.invokerKey).toBeUndefined();
+  });
+
   it("accepts invoker key alone — shared token is optional", () => {
     const key = { client_email: "sa@p.iam.gserviceaccount.com", private_key: "-----BEGIN..." };
     const ctl = resolveVmControl(

@@ -1,0 +1,49 @@
+# API Gateway spec for vm-control: exposes the IAM-protected function behind a
+# public *.gateway.dev URL authenticated by a plain API key (x-api-key header).
+# Callers hold one opaque string instead of a service-account private key; the
+# gateway invokes the backend with its own ambient identity (no key material
+# anywhere). API-key validation is gateway config, not an IAM allUsers binding,
+# so domain-restricted-sharing org policies are not violated.
+#
+# Deploy: see README.md ("API Gateway" section). After editing this file you
+# must create a NEW api-config and update the gateway to it (configs are
+# immutable).
+swagger: "2.0"
+info:
+  title: test-vm-control gateway
+  version: "1.0.0"
+schemes:
+  - https
+produces:
+  - application/json
+securityDefinitions:
+  api_key:
+    type: apiKey
+    name: x-api-key
+    in: header
+security:
+  - api_key: []
+paths:
+  /control:
+    post:
+      summary: start | stop | status | deploy for the test environment
+      operationId: control
+      x-google-backend:
+        address: https://test-vm-control-mlydlbik7a-ew.a.run.app
+        deadline: 180.0
+      parameters:
+        - name: action
+          in: query
+          required: false
+          type: string
+        - name: name
+          in: query
+          required: false
+          type: string
+        - name: sha
+          in: query
+          required: false
+          type: string
+      responses:
+        "200":
+          description: result

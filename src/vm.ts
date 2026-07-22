@@ -19,6 +19,9 @@ export interface VmControl {
   controlUrl: string;
   token?: string;          // optional shared token — defense-in-depth for publicly
                            // exposed functions; IAM-gated functions don't need it
+  apiKey?: string;         // API Gateway key (x-api-key). Preferred when present:
+                           // one opaque string, no key material, no JWT minting —
+                           // the gateway authenticates to the backend ambiently.
   healthUrl: string;
   invokerKey?: InvokerKey; // Google SA key that may ONLY invoke the function —
                            // needed when an org policy forbids public (allUsers)
@@ -57,16 +60,19 @@ export function resolveVmControl(
   }
   const tokenEnv = target.control_token_env ?? `DIRECTUS_${name.toUpperCase()}_CONTROL_TOKEN`;
   const token = env[tokenEnv]; // optional — IAM-gated functions need no shared token
+  const keyEnv = target.control_key_env ?? `DIRECTUS_${name.toUpperCase()}_CONTROL_KEY`;
+  const apiKey = env[keyEnv]; // API Gateway key — preferred transport when set
   const invokerKey = resolveInvokerKey(name, target, env);
-  if (!token && !invokerKey) {
+  if (!token && !invokerKey && !apiKey) {
     throw new Error(
-      `target '${name}': no control credentials — set $${tokenEnv} (shared token) and/or $${target.control_invoker_key_env ?? `DIRECTUS_${name.toUpperCase()}_INVOKER_KEY_B64`} (invoker SA key)`,
+      `target '${name}': no control credentials — set $${keyEnv} (API Gateway key), $${tokenEnv} (shared token), or $${target.control_invoker_key_env ?? `DIRECTUS_${name.toUpperCase()}_INVOKER_KEY_B64`} (invoker SA key)`,
     );
   }
 
   return {
     controlUrl: target.control_url.replace(/\/+$/, ""),
     token,
+    apiKey,
     healthUrl: `${target.base_url.replace(/\/+$/, "")}/server/health`,
     invokerKey,
   };
@@ -79,7 +85,9 @@ export async function callControl(
 ): Promise<Record<string, unknown>> {
   const headers: Record<string, string> = {};
   if (ctl.token) headers["X-Control-Token"] = ctl.token;
-  if (ctl.invokerKey) {
+  if (ctl.apiKey) {
+    headers["x-api-key"] = ctl.apiKey; // gateway authenticates to the backend itself
+  } else if (ctl.invokerKey) {
     headers.Authorization = `Bearer ${await mintIdToken(ctl.invokerKey, ctl.controlUrl)}`;
   }
   const qs = new URLSearchParams({ action, ...params });
