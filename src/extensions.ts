@@ -21,7 +21,7 @@ import { join, resolve } from "node:path";
 //
 // Config is a JSON file (see TargetsFile). One file per repo, checked in.
 
-import { loadTargets } from "./targets.js";
+import { loadTargets, resolveAdminToken } from "./targets.js";
 import type { TargetConfig, TargetsFile } from "./targets.js";
 // Re-export so existing importers (cli, overview, mcp-server) keep working.
 export { loadTargets } from "./targets.js";
@@ -39,9 +39,10 @@ export interface PushInput {
   repoRoot: string;
   skipBuild?: boolean;
   publish?: boolean;      // also upload the built tarball to gs://<bucket>/<name>/<sha>.tgz
-  via?: "ssh" | "control"; // transport: rsync/SSH directly (default), or the target's
-                           // control_url function — implies publish; for callers with no
-                           // SSH egress (agent sandboxes). Same semantics as promote --via.
+  via?: "ssh" | "control" | "api"; // transport: rsync/SSH directly (default); the target's
+                           // control_url function (implies publish); or the target's own
+                           // ext-deploy endpoint (body mode — tarball in the request,
+                           // Directus admin token auth, test only). No SSH for control/api.
   allowDirty?: boolean;   // permit dirty worktree when publishing (never for prod)
   force?: boolean;        // overwrite an existing artifact
 }
@@ -292,6 +293,47 @@ export async function pushExtension(input: PushInput): Promise<PushResult> {
     };
   }
 
+  // API transport (body mode): POST the tarball straight to the target's
+  // ext-deploy endpoint — Directus admin token auth, sha256 verified server-
+  // side, per-file atomic install. Contract pinned on backend #378/#379.
+  if (input.via === "api") {
+    const token = resolveAdminToken(input.target, target, process.env);
+    const { readFile: read } = await import("node:fs/promises");
+    const { tarball, sha256 } = await createArtifactTarball(
+      input.extensionName,
+      extDir,
+      (artifactSourceCommit ?? sourceCommit).slice(0, 12),
+    );
+    const transportStart = Date.now();
+    const url = `${target.base_url.replace(/\/+$/, "")}/ext-deploy/${input.extensionName}`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ sha256, tarball: (await read(tarball)).toString("base64") }),
+    });
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      const hint =
+        r.status === 404
+          ? " (ext-deploy not enabled on this target? body mode requires EXT_DEPLOY_MODE=body)"
+          : r.status === 403
+            ? " (token is not admin)"
+            : "";
+      throw new Error(`ext-deploy POST failed: HTTP ${r.status}${hint} ${body.slice(0, 300)}`);
+    }
+    const transportDurationMs = Date.now() - transportStart;
+    const verifiedCommit = await verifyMeta(target.base_url, input.extensionName, sourceCommit);
+    return {
+      extensionName: input.extensionName,
+      target: input.target,
+      sourceCommit,
+      buildDurationMs,
+      transportDurationMs,
+      verifiedCommit,
+      artifact,
+    };
+  }
+
   // Control transport: the artifact is in the bucket; install it through the
   // target's control function (same install script, SSH executed inside GCP)
   // and verify /_meta. No SSH leaves this process.
@@ -432,6 +474,40 @@ async function gsutilAvailable(): Promise<boolean> {
   }
 }
 
+// Build the artifact tarball for an extension. Constraints come from the
+// ext-deploy endpoint's minimal tar reader (backend #379/#383):
+//   - plain USTAR (--format=ustar; bsdtar defaults to PAX, GNU tar to GNU)
+//   - FILE entries only: package.json + dist/*.js named explicitly, so no
+//     directory entries, no symlinks, nothing recursive sneaks in
+// COPYFILE_DISABLE + --no-mac-metadata strip Darwin AppleDouble noise.
+async function createArtifactTarball(
+  extName: string,
+  extDir: string,
+  sourceCommit: string,
+): Promise<{ tarball: string; sha256: string }> {
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const stage = await mkdtemp(join(tmpdir(), `dd-artifact-${extName}-`));
+  const tarball = join(stage, `${sourceCommit}.tgz`);
+
+  const isDarwin = process.platform === "darwin";
+  const q = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+  const macFlag = isDarwin ? "--no-mac-metadata " : "";
+  // dist/*.js expanded by the shell → explicit file entries only.
+  const cmd = `cd ${q(extDir)} && COPYFILE_DISABLE=1 tar --format=ustar ${macFlag}-cf - package.json dist/*.js | gzip -n > ${q(tarball)}`;
+  const rTar = await runCommand("sh", ["-c", cmd]);
+  if (rTar.code !== 0) {
+    throw new Error(`tar/gzip failed: ${rTar.stderr.trim() || rTar.stdout.trim()}`);
+  }
+
+  const shaBin = isDarwin ? "shasum" : "sha256sum";
+  const shaArgs = isDarwin ? ["-a", "256", tarball] : [tarball];
+  const rSha = await assertCommand(shaBin, shaArgs, { label: `sha256 ${tarball}` });
+  const sha256 = rSha.stdout.trim().split(/\s+/)[0] ?? "";
+  if (!sha256) throw new Error(`could not compute sha256 for ${tarball}`);
+  return { tarball, sha256 };
+}
+
 async function publishTarball(input: {
   repoRoot: string;
   extName: string;
@@ -476,38 +552,8 @@ async function publishTarball(input: {
     return { artifactUri, sha256: sha, alreadyPublished: true };
   }
 
-  const { mkdtemp, writeFile } = await import("node:fs/promises");
-  const { tmpdir } = await import("node:os");
-  const stage = await mkdtemp(join(tmpdir(), `dd-artifact-${extName}-`));
-  const tarball = join(stage, `${sourceCommit}.tgz`);
-
-  // COPYFILE_DISABLE + --no-mac-metadata strip Darwin's AppleDouble headers
-  // so GNU tar on the VM doesn't spew "Ignoring unknown extended header
-  // keyword" warnings on extract. Matches scripts/build-extension.sh.
-  //
-  // --format=ustar (supported by both GNU tar and bsdtar) pins the archive to
-  // plain USTAR: bsdtar defaults to PAX and GNU tar to its own format, and
-  // strict/minimal readers — the ext-deploy endpoint's Node tar parser — only
-  // accept USTAR. Extension bundles (short names, small files) fit USTAR's
-  // limits with room to spare.
-  const isDarwin = process.platform === "darwin";
-  const tarArgs = ["-C", extDir, "--format=ustar"];
-  if (isDarwin) tarArgs.push("--no-mac-metadata");
-  tarArgs.push("-cf", "-", "dist", "package.json");
-
-  // tar → gzip → file. Two-child pipeline; keep it simple with shell.
-  const cmd = `COPYFILE_DISABLE=1 tar ${tarArgs.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(" ")} | gzip -n > '${tarball.replace(/'/g, "'\\''")}'`;
-  const rTar = await runCommand("sh", ["-c", cmd]);
-  if (rTar.code !== 0) {
-    throw new Error(`tar/gzip failed: ${rTar.stderr.trim() || rTar.stdout.trim()}`);
-  }
-
-  // sha256 (uses shasum on macOS, sha256sum on Linux).
-  const shaBin = isDarwin ? "shasum" : "sha256sum";
-  const shaArgs = isDarwin ? ["-a", "256", tarball] : [tarball];
-  const rSha = await assertCommand(shaBin, shaArgs, { label: `sha256 ${tarball}` });
-  const sha = rSha.stdout.trim().split(/\s+/)[0] ?? "";
-  if (!sha) throw new Error(`could not compute sha256 for ${tarball}`);
+  const { writeFile } = await import("node:fs/promises");
+  const { tarball, sha256: sha } = await createArtifactTarball(extName, extDir, sourceCommit);
   const shaFile = `${tarball}.sha256`;
   await writeFile(shaFile, `${sha}  ${extName}/${sourceCommit}.tgz\n`, "utf8");
 
@@ -536,7 +582,9 @@ export interface PromoteInput {
   targetsFile: string;
   repoRoot: string;
   sourceCommit?: string;  // override the resolved short-sha (promote a specific historical artifact)
-  via?: "ssh" | "control"; // transport: direct SSH (default) or the target's control_url function
+  via?: "ssh" | "control" | "api"; // direct SSH (default), the control_url function, or the
+                                   // target's ext-deploy endpoint in gcs mode (deploy-by-reference)
+  force?: boolean;        // api mode: override the endpoint's builtAt downgrade guard
 }
 
 export interface PromoteResult {
@@ -564,6 +612,63 @@ export async function promoteExtension(input: PromoteInput): Promise<PromoteResu
     input.sourceCommit ?? (await resolveArtifactSourceCommit(repoRoot, input.extensionName));
   const bucket = targetArtifactBucket(target);
   const artifactUri = `${bucket}/${input.extensionName}/${sourceCommit}.tgz`;
+
+  // API transport (gcs mode, backend #382/#383): deploy-by-reference. POST
+  // {name, sourceCommit} to the target's ext-deploy endpoint; the endpoint
+  // itself pulls gs://…/<name>/<commit>.tgz via the VM's ambient identity and
+  // installs. The admin token can only choose among already-published
+  // artifacts — no code travels in the request.
+  if (input.via === "api") {
+    const token = resolveAdminToken(input.target, target, process.env);
+    // Fail fast client-side when we CAN check the bucket (gsutil on laptops);
+    // otherwise the endpoint 400s with a clear message.
+    if (await gsutilAvailable()) {
+      if (!(await gsutilStatExists(artifactUri))) {
+        throw new Error(
+          `no artifact at ${artifactUri} — publish first: directus-deploy extensions push ${input.extensionName} --target test --via control (or --publish)`,
+        );
+      }
+    }
+    const transportStart = Date.now();
+    const url = `${target.base_url.replace(/\/+$/, "")}/ext-deploy/`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        // Required when the target sets EXT_DEPLOY_REQUIRE_CONFIRM=true (prod);
+        // harmless elsewhere. Echoes the exact name:commit being deployed.
+        "X-Deploy-Confirm": `${input.extensionName}:${sourceCommit}`,
+      },
+      body: JSON.stringify({
+        name: input.extensionName,
+        sourceCommit,
+        ...(input.force ? { force: true } : {}),
+      }),
+    });
+    if (!r.ok) {
+      const body = await r.text().catch(() => "");
+      const hint =
+        r.status === 409
+          ? " — downgrade guard: the referenced artifact is older than what's installed; re-run with --force to override"
+          : r.status === 404
+            ? " (ext-deploy gcs mode not enabled on this target?)"
+            : r.status === 403
+              ? " (token is not admin)"
+              : "";
+      throw new Error(`ext-deploy promote failed: HTTP ${r.status}${hint} ${body.slice(0, 300)}`);
+    }
+    const transportDurationMs = Date.now() - transportStart;
+    const verifiedCommit = await verifyMeta(target.base_url, input.extensionName, sourceCommit);
+    return {
+      extensionName: input.extensionName,
+      target: input.target,
+      sourceCommit,
+      artifactUri,
+      transportDurationMs,
+      verifiedCommit,
+    };
+  }
 
   // Control transport: the target's vm-control function runs the identical
   // install script over SSH from inside GCP. Used where the caller has no

@@ -318,7 +318,9 @@ no gsutil, no gcloud needed; credentials come from env by convention):
     build+deploy to test (also archives to the bucket; no SSH):
       directus-deploy extensions push <name> --target test --via control
     put the SAME tested build on staging/prod (never rebuilds; refuses if unarchived):
-      directus-deploy extensions promote <name> --target staging   # checkout picks the sha
+      directus-deploy extensions promote <name> --target staging --via api
+      (deploy-by-reference: the target's ext-deploy endpoint pulls the artifact from
+       the bucket itself; auth = DIRECTUS_<TARGET>_TOKEN; 409 = downgrade guard, see --force)
 
   Verify what's actually running:
     directus-deploy extensions status --target test
@@ -1087,7 +1089,7 @@ extensionsGroup
   .option("--publish", "also publish an immutable artifact to gs://<artifact_bucket>/<name>/<sha>.tgz (build-once/promote-many)")
   .option(
     "--via <transport>",
-    "ssh (default): rsync/ssh directly to the VM. control: publish the artifact and install it through the target's control_url function — full deploy with no SSH egress (implies --publish)",
+    "ssh (default): rsync/ssh directly to the VM. control: publish + install through the target's control_url function (implies --publish). api: POST the tarball to the target's ext-deploy endpoint (body mode; Directus admin token; test only). control/api need no SSH egress",
     "ssh",
   )
   .option("--allow-dirty", "permit publish from a dirty worktree (artifact won't be reproducible; never for prod)")
@@ -1103,8 +1105,8 @@ extensionsGroup
     allowDirty?: boolean;
     force?: boolean;
   }) => {
-    if (!["ssh", "control"].includes(opts.via)) {
-      process.stderr.write(`unknown --via '${opts.via}' (ssh | control)\n`);
+    if (!["ssh", "control", "api"].includes(opts.via)) {
+      process.stderr.write(`unknown --via '${opts.via}' (ssh | control | api)\n`);
       process.exit(2);
     }
     const { pushExtension, shaMatch } = await import("./extensions.js");
@@ -1131,7 +1133,7 @@ extensionsGroup
           repoRoot: opts.repoRoot,
           skipBuild: Boolean(opts.skipBuild),
           publish: Boolean(opts.publish) || opts.via === "control", // control transport deploys from the bucket
-          via: opts.via as "ssh" | "control",
+          via: opts.via as "ssh" | "control" | "api",
           allowDirty: Boolean(opts.allowDirty),
           force: Boolean(opts.force),
         });
@@ -1240,9 +1242,10 @@ extensionsGroup
   .option("--source-commit <sha>", "override the resolved short-sha (promote a specific historical artifact)")
   .option(
     "--via <transport>",
-    "ssh (default): rsync/ssh directly to the VM. control: deploy through the target's control_url function — for callers without SSH egress (agent sandboxes)",
+    "ssh (default): rsync/ssh directly to the VM. control: deploy through the target's control_url function. api: deploy-by-reference through the target's ext-deploy endpoint in gcs mode — the endpoint pulls the artifact from the bucket itself (staging/prod path; Directus admin token). control/api need no SSH egress",
     "ssh",
   )
+  .option("--force", "api mode: override the endpoint's builtAt downgrade guard (deploy an OLDER published artifact deliberately)")
   .action(async (names: string[], opts: {
     target: string;
     targetsFile: string;
@@ -1250,9 +1253,10 @@ extensionsGroup
     all?: boolean;
     sourceCommit?: string;
     via: string;
+    force?: boolean;
   }) => {
-    if (!["ssh", "control"].includes(opts.via)) {
-      process.stderr.write(`unknown --via '${opts.via}' (ssh | control)\n`);
+    if (!["ssh", "control", "api"].includes(opts.via)) {
+      process.stderr.write(`unknown --via '${opts.via}' (ssh | control | api)\n`);
       process.exit(2);
     }
     const { promoteExtension, shaMatch } = await import("./extensions.js");
@@ -1282,7 +1286,8 @@ extensionsGroup
           targetsFile: opts.targetsFile,
           repoRoot: opts.repoRoot,
           sourceCommit: opts.sourceCommit,
-          via: opts.via as "ssh" | "control",
+          via: opts.via as "ssh" | "control" | "api",
+          force: Boolean(opts.force),
         });
         const verify = r.verifiedCommit
           ? shaMatch(r.verifiedCommit, r.sourceCommit)

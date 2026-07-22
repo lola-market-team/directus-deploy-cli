@@ -94,6 +94,15 @@ describe("buildIdTokenAssertion", () => {
   });
 });
 
+describe("resolveAdminToken", () => {
+  it("uses the DIRECTUS_<TARGET>_TOKEN convention and honors token_env", async () => {
+    const { resolveAdminToken } = await import("../../src/targets.js");
+    expect(resolveAdminToken("staging", { ...base }, { DIRECTUS_STAGING_TOKEN: "t1" })).toBe("t1");
+    expect(resolveAdminToken("staging", { ...base, token_env: "MY_T" }, { MY_T: "t2" })).toBe("t2");
+    expect(() => resolveAdminToken("prod", { ...base }, {})).toThrow(/DIRECTUS_PROD_TOKEN/);
+  });
+});
+
 describe("buildAccessTokenAssertion", () => {
   it("carries a scope claim instead of target_audience", () => {
     const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });

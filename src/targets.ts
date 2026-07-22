@@ -22,6 +22,19 @@ export interface TargetConfig {
   control_invoker_key_env?: string; // env var holding a base64 SA key with run.invoker on the control fn, for orgs that forbid public endpoints (default: DIRECTUS_<UPPER>_INVOKER_KEY_B64)
 }
 
+// Admin token for a target, by convention: token_env field, else
+// DIRECTUS_<UPPER>_TOKEN. Pure — exported for tests.
+export function resolveAdminToken(
+  name: string,
+  target: TargetConfig,
+  env: Record<string, string | undefined>,
+): string {
+  const tokenEnv = target.token_env ?? `DIRECTUS_${name.toUpperCase()}_TOKEN`;
+  const token = env[tokenEnv];
+  if (!token) throw new Error(`target '${name}': $${tokenEnv} is not set in env`);
+  return token;
+}
+
 export async function loadTargets(path: string): Promise<TargetsFile> {
   const raw = await readFile(path, "utf8");
   const parsed = JSON.parse(raw) as TargetsFile;
