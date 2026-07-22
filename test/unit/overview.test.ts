@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   classifyPromotionPaths,
   inferPromotionPair,
+  resolvePromotionPair,
   renderOverview,
   hasDrift,
   hasErrors,
@@ -80,12 +81,41 @@ describe("inferPromotionPair", () => {
   });
 });
 
+describe("resolvePromotionPair", () => {
+  const dev = { ref: "origin/develop", buildForbidden: false };
+  const prod = { ref: "origin/master", buildForbidden: true };
+
+  it("uses the probed targets when they infer cleanly", () => {
+    expect(resolvePromotionPair([dev, prod], [dev, dev, prod])).toEqual({
+      from: "origin/develop",
+      to: "origin/master",
+    });
+  });
+
+  it("widens to the full targets file when probing a single-ref subset", () => {
+    expect(resolvePromotionPair([dev], [dev, dev, prod])).toEqual({
+      from: "origin/develop",
+      to: "origin/master",
+    });
+    expect(resolvePromotionPair([prod], [dev, prod])).toEqual({
+      from: "origin/develop",
+      to: "origin/master",
+    });
+  });
+
+  it("falls back to the conventional pair when even the full file can't infer", () => {
+    const out = resolvePromotionPair([dev], [dev, dev]);
+    expect(out).toMatchObject({ from: "origin/develop", to: "origin/master" });
+    expect(out).toHaveProperty("fallback");
+  });
+});
+
 function cleanTarget(name: string, ref: string): TargetOverview {
   return {
     target: name,
     ref,
     migrations: { applied: 42, pending: 0, mutated: 0, pendingList: [], mutatedList: [] },
-    extensions: { match: 7, drift: 0, missing: 0, driftList: [], missingList: [] },
+    extensions: { match: 7, drift: 0, missing: 0, driftList: [], missingList: [], sourceCommits: {} },
     config: { changes: 0, changeList: [] },
     seeds: { changes: 0, changeList: [] },
   };
@@ -100,8 +130,21 @@ describe("renderOverview / hasDrift / hasErrors", () => {
         to: "origin/master",
         commitsAhead: 14,
         commitsBehind: 0,
+        commits: [
+          { sha: "59ce4ffc", subject: "search: categoryIds multi-category filter (#388)" },
+          { sha: "c60c8804", subject: "fix: group feed excludes listings pinned to other groups (#381)" },
+        ],
+        commitsTruncated: false,
         migrations: { added: ["043_x.sql"], modified: [], removed: [] },
         extensions: ["chat"],
+        extensionDetails: [
+          {
+            name: "chat",
+            expected: "59ce4ffc",
+            running: { target: "prod", commit: "5cb20e99" },
+            commits: [{ sha: "59ce4ffc", subject: "search: categoryIds multi-category filter (#388)" }],
+          },
+        ],
         schema: [],
         seeds: [],
       },
@@ -114,10 +157,33 @@ describe("renderOverview / hasDrift / hasErrors", () => {
     expect(out).toMatch(/✓ 7\/7 match/);
     expect(out).toMatch(/1 new/);
     expect(out).toMatch(/14 commit\(s\) ahead/);
+    expect(out).toMatch(/59ce4ffc  search: categoryIds multi-category filter \(#388\)/);
     expect(out).toMatch(/queued migration: 043_x\.sql/);
+    expect(out).toMatch(/queued extension chat — prod runs 5cb20e99 → would get 59ce4ffc/);
     expect(out).toMatch(/All environments in sync\./);
     expect(hasDrift(report)).toBe(false);
     expect(hasErrors(report)).toBe(false);
+  });
+
+  it("renders extension detail without running state as 'would deploy'", () => {
+    const report: OverviewReport = {
+      targets: [cleanTarget("test", "origin/develop")],
+      promotion: {
+        from: "origin/develop",
+        to: "origin/master",
+        commitsAhead: 1,
+        commitsBehind: 0,
+        commits: [{ sha: "aaaa111", subject: "feat: x" }],
+        commitsTruncated: false,
+        migrations: { added: [], modified: [], removed: [] },
+        extensions: ["search"],
+        extensionDetails: [{ name: "search", expected: "aaaa111", running: null, commits: [] }],
+        schema: [],
+        seeds: [],
+      },
+    };
+    const out = renderOverview(report);
+    expect(out).toMatch(/queued extension search — would deploy aaaa111/);
   });
 
   it("surfaces drift details and flags unreachable dimensions", () => {

@@ -44,7 +44,9 @@ $ directus-deploy overview
   seeds       ✓ in sync           ✗ 31 changes        ✓ in sync           3 file(s)
 ```
 
-Each target declares its branch in the targets file (`"ref": "origin/develop"`); the artifacts at that ref are materialized via `git archive` and dry-run against the env, so the comparison is branch-vs-env, not worktree-vs-env. A target without `ref` falls back to the working tree. The promotion pair is inferred from the refs (the `build_forbidden` target pins the destination) or passed with `--from`/`--to`; it is pure git and never affects the exit code.
+Each target declares its branch in the targets file (`"ref": "origin/develop"`); the artifacts at that ref are materialized via `git archive` and dry-run against the env, so the comparison is branch-vs-env, not worktree-vs-env. A target without `ref` falls back to the working tree. The promotion pair is inferred from the refs (the `build_forbidden` target pins the destination), widening to the full targets file when only a subset is probed and defaulting to `origin/develop → origin/master` as a last resort; `--from`/`--to` override. It is pure git and never affects the exit code.
+
+Below the matrix, the promotion block is a release preview: the queued commit list (merge subjects carry PR numbers), and per queued extension the expected artifact commit joined with what the destination currently runs (`prod runs 5cb20e99 → would get 59ce4ffc`) plus the commits in between — the same view a release PR body would show. The join reuses the `/_meta` sourceCommit already fetched for the extensions row, so it costs no extra network.
 
 Exit codes: `0` in sync, `1` drift, `2` a check could not run. `--json` emits the full report (untruncated detail lists) for dashboards or Slack bots.
 

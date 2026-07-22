@@ -52,15 +52,49 @@ async function git(repoRoot: string, args: string[]): Promise<string> {
 
 // -------------------- promotion queue --------------------
 
+export interface PromotionCommit {
+  sha: string;      // short sha
+  subject: string;  // merge subjects carry PR numbers for free
+}
+
+export interface PromotionExtensionDetail {
+  name: string;
+  // Expected artifact source commit at `from` — same formula as
+  // scripts/build-extension.sh / promoteExtension: last commit touching
+  // extensions/<name>/ excluding dist/ and the stamped build-info.
+  expected: string | null;
+  // What the promotion destination currently runs — joined from the /_meta
+  // sourceCommit a probed target on the `to` ref already fetched. No extra
+  // network; null when no such target was probed or /_meta was unreachable.
+  running: { target: string; commit: string } | null;
+  commits: PromotionCommit[]; // commits in to..from touching this extension
+}
+
 export interface PromotionQueue {
   from: string;
   to: string;
   commitsAhead: number;   // commits on `from` not on `to`
   commitsBehind: number;  // commits on `to` not on `from` (hotfix smell)
+  commits: PromotionCommit[];  // to..from, newest first, capped
+  commitsTruncated: boolean;   // commitsAhead exceeded the cap
   migrations: { added: string[]; modified: string[]; removed: string[] };
   extensions: string[];   // extension names whose src/ differs
+  extensionDetails: PromotionExtensionDetail[]; // one per `extensions` entry
   schema: string[];       // snapshot/collections/register files that differ
   seeds: string[];        // seed files that differ
+}
+
+const COMMIT_LIST_CAP = 30;
+
+function parseCommitLog(raw: string): PromotionCommit[] {
+  return raw
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((l) => {
+      const [sha = "", ...rest] = l.split("\t");
+      return { sha, subject: rest.join("\t") };
+    });
 }
 
 // Classify `git diff --name-status <to> <from>` lines into the overview's
@@ -132,7 +166,49 @@ export async function computePromotionQueue(
       const [status = "", ...rest] = l.split("\t");
       return { status: status.charAt(0), path: rest.join("\t") };
     });
-  return { from, to, commitsAhead: ahead, commitsBehind: behind, ...classifyPromotionPaths(entries) };
+  const classified = classifyPromotionPaths(entries);
+
+  const commits = parseCommitLog(
+    await git(repoRoot, ["log", "--format=%h%x09%s", "-n", String(COMMIT_LIST_CAP), `${to}..${from}`]),
+  );
+
+  const extensionDetails: PromotionExtensionDetail[] = [];
+  for (const name of classified.extensions) {
+    // Same pathspec as resolveArtifactSourceCommit — the bucket filename /
+    // /_meta.sourceCommit convention.
+    const pathspec = [
+      "--",
+      `extensions/${name}`,
+      `:!extensions/${name}/dist`,
+      `:!extensions/${name}/src/build-info.ts`,
+    ];
+    let expected: string | null = null;
+    try {
+      expected = (await git(repoRoot, ["log", "-1", "--format=%h", from, ...pathspec])).trim() || null;
+    } catch {
+      // ref vanished mid-run or pathspec quirk — detail row still renders
+    }
+    let extCommits: PromotionCommit[] = [];
+    try {
+      extCommits = parseCommitLog(
+        await git(repoRoot, ["log", "--format=%h%x09%s", "-n", String(COMMIT_LIST_CAP), `${to}..${from}`, ...pathspec]),
+      );
+    } catch {
+      // same — leave the commit list empty rather than dropping the row
+    }
+    extensionDetails.push({ name, expected, running: null, commits: extCommits });
+  }
+
+  return {
+    from,
+    to,
+    commitsAhead: ahead,
+    commitsBehind: behind,
+    commits,
+    commitsTruncated: ahead > COMMIT_LIST_CAP,
+    ...classified,
+    extensionDetails,
+  };
 }
 
 // -------------------- ref materialization --------------------
@@ -168,6 +244,9 @@ export interface ExtensionsSummary {
   missing: number;
   driftList: Array<{ name: string; hint: string | null }>;
   missingList: string[];
+  // Deployed /_meta sourceCommit per extension (null when unreachable).
+  // Feeds the promotion release preview's "prod runs X → would get Y" join.
+  sourceCommits: Record<string, string | null>;
 }
 
 export interface ChangeSummary {
@@ -240,10 +319,11 @@ async function checkTarget(input: {
         repoRoot: input.repoRoot,
         reference: input.ref ?? "HEAD",
       });
-      const summary: ExtensionsSummary = { match: 0, drift: 0, missing: 0, driftList: [], missingList: [] };
+      const summary: ExtensionsSummary = { match: 0, drift: 0, missing: 0, driftList: [], missingList: [], sourceCommits: {} };
       for (const row of report.rows) {
         const cell = row.cells[input.name];
         if (!cell) continue;
+        summary.sourceCommits[row.extension] = cell.sourceCommit;
         if (cell.error) {
           summary.missing++;
           summary.missingList.push(row.extension);
@@ -366,6 +446,22 @@ export function inferPromotionPair(
   return { from, to };
 }
 
+// The promotion queue is repo state, not target state — probing a single-ref
+// subset (`--targets staging,prod` on the same ref, or one target) must not
+// lose the column. Widen to the full targets file, then to the conventional
+// branch pair; a nonexistent fallback ref surfaces as promotionSkipped via
+// the git error downstream.
+export function resolvePromotionPair(
+  probed: Array<{ ref: string | null; buildForbidden: boolean }>,
+  all: Array<{ ref: string | null; buildForbidden: boolean }>,
+): { from: string; to: string; fallback?: string } | { skipped: string } {
+  const fromProbed = inferPromotionPair(probed);
+  if (!("skipped" in fromProbed)) return fromProbed;
+  const fromAll = inferPromotionPair(all);
+  if (!("skipped" in fromAll)) return fromAll;
+  return { from: "origin/develop", to: "origin/master", fallback: fromAll.skipped };
+}
+
 export async function runOverview(input: OverviewInput): Promise<OverviewReport> {
   const repoRoot = resolve(input.repoRoot);
   const cfg = await loadTargets(input.targetsFile);
@@ -416,18 +512,17 @@ export async function runOverview(input: OverviewInput): Promise<OverviewReport>
 
   let promotion: PromotionQueue | null = null;
   let promotionSkipped: string | undefined;
-  let pair: { from: string; to: string } | { skipped: string };
+  let pair: { from: string; to: string; fallback?: string } | { skipped: string };
   if (input.from && input.to) {
     pair = { from: input.from, to: input.to };
   } else if (input.from || input.to) {
     pair = { skipped: "--from and --to must be passed together" };
   } else {
-    pair = inferPromotionPair(
-      names.map((n) => ({
-        ref: cfg.targets[n]!.ref ?? null,
-        buildForbidden: Boolean(cfg.targets[n]!.build_forbidden),
-      })),
-    );
+    const shape = (n: string) => ({
+      ref: cfg.targets[n]!.ref ?? null,
+      buildForbidden: Boolean(cfg.targets[n]!.build_forbidden),
+    });
+    pair = resolvePromotionPair(names.map(shape), Object.keys(cfg.targets).map(shape));
   }
   const promotionPromise = (async () => {
     if ("skipped" in pair) {
@@ -437,12 +532,29 @@ export async function runOverview(input: OverviewInput): Promise<OverviewReport>
     try {
       promotion = await computePromotionQueue(repoRoot, pair.from, pair.to);
     } catch (e) {
-      promotionSkipped = (e as Error).message;
+      promotionSkipped = pair.fallback
+        ? `${pair.fallback}; fallback ${pair.from} → ${pair.to} failed: ${(e as Error).message}`
+        : (e as Error).message;
     }
   })();
 
   const targets = await Promise.all(targetChecks);
   await promotionPromise;
+
+  // Release preview join: what does the destination currently run? A probed
+  // target deployed from the `to` ref already fetched /_meta sourceCommit
+  // for every extension — reuse it, no extra network.
+  if (promotion !== null) {
+    const p: PromotionQueue = promotion;
+    const dest = targets.find((t) => t.ref === p.to && !isErr(t.extensions));
+    if (dest) {
+      const running = (dest.extensions as ExtensionsSummary).sourceCommits;
+      for (const d of p.extensionDetails) {
+        const commit = running[d.name];
+        if (commit) d.running = { target: dest.target, commit };
+      }
+    }
+  }
 
   // Best-effort temp cleanup — a leaked dir in tmpdir is harmless.
   for (const p of matCache.values()) {
@@ -556,10 +668,31 @@ export function renderOverview(report: OverviewReport): string {
           : ""),
     );
     const promoDetails: string[] = [];
+    for (const c of truncate(promo.commits.map((x) => `${x.sha}  ${x.subject}`), 10)) {
+      promoDetails.push(`    ${c}`);
+    }
+    if (promo.commitsTruncated && promo.commitsAhead > promo.commits.length) {
+      promoDetails.push(`    … commit list capped at ${promo.commits.length} (see --json)`);
+    }
     for (const m of promo.migrations.added) promoDetails.push(`  queued migration: ${m}`);
     for (const m of promo.migrations.modified) promoDetails.push(`  ⚠ migration MODIFIED between refs: ${m}`);
     for (const m of promo.migrations.removed) promoDetails.push(`  ⚠ migration removed on ${short(promo.from)}: ${m}`);
-    if (promo.extensions.length) promoDetails.push(`  queued extensions: ${promo.extensions.join(", ")}`);
+    for (const d of promo.extensionDetails) {
+      const would = d.expected ? `would get ${d.expected}` : "queued";
+      const head = d.running
+        ? `${d.running.target} runs ${d.running.commit} → ${would}`
+        : d.expected
+          ? `would deploy ${d.expected}`
+          : "queued";
+      promoDetails.push(`  queued extension ${d.name} — ${head}`);
+      for (const c of truncate(d.commits.map((x) => `${x.sha}  ${x.subject}`), 8)) {
+        promoDetails.push(`    ${c}`);
+      }
+    }
+    // Extensions the diff flagged but detail resolution missed entirely.
+    const detailed = new Set(promo.extensionDetails.map((d) => d.name));
+    const undetailed = promo.extensions.filter((n) => !detailed.has(n));
+    if (undetailed.length) promoDetails.push(`  queued extensions: ${undetailed.join(", ")}`);
     if (promoDetails.length) lines.push(...promoDetails.map((d) => `  ${d}`));
   } else if (report.promotionSkipped) {
     lines.push(`  (promotion column skipped: ${report.promotionSkipped})`);
