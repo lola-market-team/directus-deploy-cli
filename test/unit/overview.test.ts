@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { execSync } from "node:child_process";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   classifyPromotionPaths,
+  computePromotionQueue,
   inferPromotionPair,
   resolvePromotionPair,
   renderOverview,
@@ -78,6 +83,49 @@ describe("inferPromotionPair", () => {
       { ref: "origin/master", buildForbidden: false },
     ]);
     expect(pair).toHaveProperty("skipped");
+  });
+});
+
+describe("computePromotionQueue commitsBehind (patch-id aware)", () => {
+  // Reproduces the lola-market-backend graph shape: release merge commits
+  // live only on master, and a squash-hotfix lands on master while the same
+  // patch lands on develop under a different SHA. Neither is missing content.
+  it("ignores release merges and patch-id twins; counts genuine hotfixes", async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), "overview-cherry-"));
+    const g = (cmd: string) =>
+      execSync(`git -c user.email=t@t -c user.name=t ${cmd}`, { cwd: repoRoot, encoding: "utf8" }).trim();
+    await mkdir(join(repoRoot, "migrations"), { recursive: true });
+    await writeFile(join(repoRoot, "migrations/001_a.sql"), "select 1;\n", "utf8");
+    g("init -qb master");
+    g("add .");
+    g("commit -qm base");
+    // develop moves ahead by one deployable commit
+    g("checkout -qb develop");
+    await writeFile(join(repoRoot, "migrations/002_b.sql"), "select 2;\n", "utf8");
+    g("add .");
+    g("commit -qm 'feat: migration 002'");
+    // release: merge develop into master (merge commit exists only on master)
+    g("checkout -q master");
+    g("merge -q --no-ff develop -m 'Merge pull request #1 from team/develop'");
+    // squash-twin hotfix: identical patch on both sides, different SHAs
+    await writeFile(join(repoRoot, "migrations/003_fix.sql"), "select 3;\n", "utf8");
+    g("add .");
+    g("commit -qm 'hotfix: 003 (squash)'");
+    g("checkout -q develop");
+    const twinSha = g("rev-parse master");
+    g(`cherry-pick ${twinSha}`);
+    g("checkout -q master");
+
+    const clean = await computePromotionQueue(repoRoot, "develop", "master");
+    expect(clean.commitsBehind).toBe(0); // raw rev-list would say 2
+    expect(clean.commitsAhead).toBeGreaterThan(0);
+
+    // a REAL hotfix on master (content nowhere on develop) must count
+    await writeFile(join(repoRoot, "migrations/004_real.sql"), "select 4;\n", "utf8");
+    g("add .");
+    g("commit -qm 'hotfix: 004 master-only'");
+    const dirty = await computePromotionQueue(repoRoot, "develop", "master");
+    expect(dirty.commitsBehind).toBe(1);
   });
 });
 

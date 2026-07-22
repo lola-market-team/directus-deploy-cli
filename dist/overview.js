@@ -79,7 +79,22 @@ export function classifyPromotionPaths(entries) {
 }
 export async function computePromotionQueue(repoRoot, from, to) {
     const ahead = Number((await git(repoRoot, ["rev-list", "--count", `${to}..${from}`])).trim());
-    const behind = Number((await git(repoRoot, ["rev-list", "--count", `${from}..${to}`])).trim());
+    // Behind answers "does `to` hold CONTENT that `from` lacks" — the thing the
+    // next release would clobber. Raw SHA counting inflates it with (a) the
+    // merge commit every release PR mints on `to`, one per release forever, and
+    // (b) patch-id twins: a squash-hotfix re-applied to `from` under a new SHA.
+    // --cherry-pick cancels patch-equivalent pairs across the symmetric range;
+    // --no-merges drops merge commits (they have no patch-id and would always
+    // count). What's left is genuinely missing from `from` — a back-port that
+    // needed even one line of conflict resolution still counts, correctly.
+    const behind = Number((await git(repoRoot, [
+        "rev-list",
+        "--count",
+        "--right-only",
+        "--cherry-pick",
+        "--no-merges",
+        `${from}...${to}`,
+    ])).trim());
     const raw = await git(repoRoot, [
         "diff",
         "--name-status",
