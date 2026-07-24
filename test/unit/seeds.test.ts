@@ -194,3 +194,30 @@ describe("reconcileSeeds PK resolution (#32)", () => {
     expect(fieldCalls).toHaveLength(1);
   });
 });
+
+describe("reconcileSeeds fields restriction (#37)", () => {
+  it("fetches only seed-managed columns plus the PK", async () => {
+    const seedDir = await writeSeedDir({
+      "categories.json": {
+        collection: "categories",
+        data: [{ id: 1, code: "1", title: "Root", date_updated: "stripped" }],
+      },
+    });
+    const client = mockClient({
+      fieldsByCollection: {
+        categories: [
+          { collection: "categories", field: "id", type: "integer", schema: { is_primary_key: true } },
+        ],
+      },
+      itemsByCollection: { categories: [{ id: 1, code: "1", title: "Root" }] },
+    });
+    await reconcileSeeds({ seedDir, client, opts: { dryRun: true } });
+    const itemCall = (client.get as ReturnType<typeof vi.fn>).mock.calls
+      .map((c) => String(c[0]))
+      .find((p) => p.startsWith("/items/categories"));
+    expect(itemCall).toBeDefined();
+    const fields = decodeURIComponent(itemCall!.split("fields=")[1]!);
+    // server-only keys (date_updated) never make it into the fetch
+    expect(fields.split(",").sort()).toEqual(["code", "id", "title"]);
+  });
+});

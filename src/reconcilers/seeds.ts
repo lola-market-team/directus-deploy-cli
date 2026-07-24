@@ -77,11 +77,29 @@ function sanitizeSeedRow(row: Record<string, unknown>): Record<string, unknown> 
   return out;
 }
 
+// Restrict the read to the columns the seed manages (#37). diffSubset only
+// ever compares seed-present keys, so anything wider is wasted transfer — and
+// on wide collections it's pathological (a pgvector column turned the LOLA
+// `categories` read into ~50 MB and OOM'd the instance on every plan).
+function seedManagedFields(file: SeedFile, pk: string): string[] {
+  const keys = new Set<string>([pk]);
+  for (const row of file.data ?? []) {
+    for (const k of Object.keys(row)) {
+      if (!SERVER_ONLY_SEED_KEYS.has(k)) keys.add(k);
+    }
+  }
+  return [...keys];
+}
+
 async function listServer(
   client: DirectusClient,
   collection: string,
+  fields: string[],
 ): Promise<Record<string, unknown>[]> {
-  const raw = await client.get(`/items/${collection}?limit=-1`);
+  const fieldsParam = fields.length
+    ? `&fields=${encodeURIComponent(fields.join(","))}`
+    : "";
+  const raw = await client.get(`/items/${collection}?limit=-1${fieldsParam}`);
   if (raw === null) return [];
   if (Array.isArray(raw)) return raw as Record<string, unknown>[];
   const data = (raw as { data?: unknown }).data;
@@ -103,7 +121,7 @@ function indexByPk(
 // PK per collection via /fields/<collection>. Falls back to `id` when the
 // endpoint is unreachable or reports no PK — never throws, so a lookup
 // hiccup degrades to the historical behaviour instead of failing the file.
-async function resolvePrimaryKey(
+export async function resolvePrimaryKey(
   client: DirectusClient,
   collection: string,
   cache: Map<string, string>,
@@ -143,7 +161,7 @@ export async function reconcileSeeds(input: SeedReconcileInput): Promise<EntityR
 
     let server: Record<string, unknown>[];
     try {
-      server = await listServer(input.client, collection);
+      server = await listServer(input.client, collection, seedManagedFields(file, pk));
     } catch (e) {
       results.push({
         kind: "seeds",

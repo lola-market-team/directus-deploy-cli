@@ -1071,6 +1071,62 @@ snapshotGroup
     process.exit(anyFailed ? 1 : 0);
   });
 
+const seedsGroup = program
+  .command("seeds")
+  .description("Seed-file commands (pull from a live target)");
+
+seedsGroup
+  .command("pull")
+  .description(
+    "Regenerate directus_config/seed/<collection>.json from a Directus target, restricted to the seed-managed columns. Preserves an existing file's meta block; parents-before-children ordering for self-referencing collections; fails on duplicate PKs.",
+  )
+  .argument("<collection>", "collection name (one seed file per invocation)")
+  .option("--url <url>", "Directus base URL (env: DIRECTUS_URL)")
+  .option("--token <token>", "Directus admin token (env: DIRECTUS_TOKEN)")
+  .option(
+    "--seed-dir <path>",
+    "path to directus_config/seed",
+    "./directus_config/seed",
+  )
+  .option(
+    "--fields <csv>",
+    "columns to pull (required on first pull; later pulls derive them from the existing file)",
+  )
+  .option("--filter <json>", "raw Directus filter JSON, passed through to /items")
+  .option(
+    "--parent-field <name>",
+    "self-referencing FK used for parents-before-children ordering (default: parent_id when pulled)",
+  )
+  .option("--insert-order <n>", "meta.insert_order for a brand-new seed file", "50")
+  .action(async (collection: string, opts: {
+    url?: string;
+    token?: string;
+    seedDir: string;
+    fields?: string;
+    filter?: string;
+    parentField?: string;
+    insertOrder: string;
+  }) => {
+    const url = opts.url ?? process.env.DIRECTUS_URL;
+    const token = opts.token ?? process.env.DIRECTUS_TOKEN;
+    if (!url) throw new Error("--url or DIRECTUS_URL required");
+    if (!token) throw new Error("--token or DIRECTUS_TOKEN required");
+    const client = createDirectusClient({ baseUrl: url, token });
+    const { pullSeed } = await import("./seeds-pull.js");
+    const result = await pullSeed({
+      client,
+      seedDir: opts.seedDir,
+      collection,
+      fields: opts.fields ? opts.fields.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
+      filter: opts.filter,
+      parentField: opts.parentField,
+      insertOrder: Number(opts.insertOrder),
+    });
+    process.stdout.write(
+      `pulled ${result.rows} row(s) into ${result.path} (fields: ${result.fields.join(",")})\n`,
+    );
+  });
+
 const extensionsGroup = program
   .command("extensions")
   .description("Extension deploy over plain SSH (no gcloud, no service account)");
