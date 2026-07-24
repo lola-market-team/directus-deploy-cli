@@ -279,3 +279,45 @@ describe("renderOverview / hasDrift / hasErrors", () => {
     expect(hasErrors(report)).toBe(true);
   });
 });
+
+describe("drift probes (#38)", () => {
+  const base = {
+    ref: "origin/develop",
+    migrations: { pending: 0, mutated: 0, pendingList: [], mutatedList: [] },
+    extensions: { drift: 0, missing: 0, total: 1, driftList: [], missingList: [], sourceCommits: {} },
+    config: { changes: 0, changeList: [] },
+    seeds: { changes: 0, changeList: [] },
+  };
+  it("renders probe rows, counts probe drift and errors", () => {
+    const report = {
+      targets: [
+        { target: "test", ...base, probes: { attributes: { clean: false, summary: "4 extra attrs" } } },
+        { target: "prod", ...base, probes: { attributes: { clean: true, summary: "in sync" } } },
+      ],
+      promotion: null,
+      promotionSkipped: "n/a",
+    } as never;
+    const text = renderOverview(report);
+    expect(text).toContain("attributes");
+    expect(text).toContain("✗ 4 extra attrs");
+    expect(text).toContain("✓ in sync");
+    expect(text).toContain("Drift detected.");
+    expect(hasDrift(report)).toBe(true);
+    expect(hasErrors(report)).toBe(false);
+  });
+  it("probe error is an error, not drift; absent probes render as dash", () => {
+    const report = {
+      targets: [
+        { target: "test", ...base, probes: { attributes: { error: "probe printed no JSON" } } },
+        { target: "prod", ...base, probes: {} },
+      ],
+      promotion: null,
+      promotionSkipped: "n/a",
+    } as never;
+    const text = renderOverview(report);
+    expect(text).toContain("⚠ error");
+    expect(text).toContain("⚠ test attributes: probe printed no JSON");
+    expect(hasDrift(report)).toBe(false);
+    expect(hasErrors(report)).toBe(true);
+  });
+});

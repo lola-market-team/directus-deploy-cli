@@ -194,6 +194,7 @@ async function checkTarget(input) {
         extensions: { error: "not run" },
         config: { error: "not run" },
         seeds: { error: "not run" },
+        probes: {},
     };
     // Extensions need no token — always attempted. Compares deployed source
     // tree hash against the target's ref (worktree targets compare vs HEAD).
@@ -306,11 +307,45 @@ async function checkTarget(input) {
             return { config: { error }, seeds: { error } };
         }
     })();
-    const [ext, mig, cfg] = await Promise.all([extPromise, migPromise, cfgPromise]);
+    // Custom drift probes (#38): repo-declared commands, run from the ref's
+    // materialized tree so the probe compares against the same snapshot the
+    // other dimensions use. A probe exiting non-zero is fine as long as it
+    // printed the JSON contract (drift is exit 1 by convention).
+    const probesPromise = (async () => {
+        const res = {};
+        await Promise.all(input.probes.map(async (p) => {
+            const cmd = p.cmd
+                .replaceAll("{url}", input.baseUrl)
+                .replaceAll("{token_env}", input.tokenEnv)
+                .replaceAll("{target}", input.name);
+            try {
+                const r = await exec("sh", ["-c", cmd], input.layoutRoot);
+                const lastLine = r.stdout.trim().split("\n").pop() ?? "";
+                let parsed;
+                try {
+                    parsed = JSON.parse(lastLine);
+                }
+                catch {
+                    throw new Error(r.code === 0
+                        ? "probe printed no JSON"
+                        : `exit ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 200)}`);
+                }
+                if (parsed.error)
+                    throw new Error(parsed.error);
+                res[p.name] = { clean: Boolean(parsed.clean), summary: parsed.summary };
+            }
+            catch (e) {
+                res[p.name] = { error: e.message };
+            }
+        }));
+        return res;
+    })();
+    const [ext, mig, cfg, probes] = await Promise.all([extPromise, migPromise, cfgPromise, probesPromise]);
     out.extensions = ext;
     out.migrations = mig;
     out.config = cfg.config;
     out.seeds = cfg.seeds;
+    out.probes = probes;
     return out;
 }
 // Infer the promotion pair from the targets' refs: exactly two distinct refs,
@@ -376,6 +411,7 @@ export async function runOverview(input) {
                     extensions: { error },
                     config: { error },
                     seeds: { error },
+                    probes: {},
                 };
             }
         }
@@ -387,6 +423,7 @@ export async function runOverview(input) {
             layoutRoot,
             repoRoot,
             targetsFile: input.targetsFile,
+            probes: cfg.drift_probes ?? [],
         });
     });
     let promotion = null;
@@ -510,6 +547,18 @@ export function renderOverview(report) {
             cells.push(promotionCell(dim, promo));
         lines.push(`  ${dim.padEnd(labelWidth - 2)}` + cells.map((c) => c.padEnd(colWidth)).join("").trimEnd());
     }
+    // Custom drift-probe rows (#38) — union of probe names across targets.
+    const probeNames = [...new Set(report.targets.flatMap((t) => Object.keys(t.probes ?? {})))];
+    for (const name of probeNames) {
+        const cells = [];
+        for (const t of report.targets) {
+            const d = (t.probes ?? {})[name];
+            cells.push(d === undefined ? "—" : cellProbe(d));
+        }
+        if (promo)
+            cells.push("—");
+        lines.push(`  ${name.padEnd(labelWidth - 2)}` + cells.map((c) => c.padEnd(colWidth)).join("").trimEnd());
+    }
     // Detail block: every red/⚠ cell explains itself.
     const details = [];
     for (const t of report.targets) {
@@ -539,6 +588,12 @@ export function renderOverview(report) {
         else
             for (const c of truncate(t.seeds.changeList))
                 details.push(`✗ ${t.target} seeds ${c}`);
+        for (const [name, d] of Object.entries(t.probes ?? {})) {
+            if (isErr(d))
+                details.push(`⚠ ${t.target} ${name}: ${d.error}`);
+            else if (!d.clean)
+                details.push(`✗ ${t.target} ${name}: ${d.summary ?? "drift"}`);
+        }
     }
     if (details.length) {
         lines.push("");
@@ -596,6 +651,11 @@ export function renderOverview(report) {
             : "  All environments in sync.");
     return lines.join("\n");
 }
+function cellProbe(d) {
+    if (isErr(d))
+        return "⚠ error";
+    return d.clean ? "✓ in sync" : `✗ ${d.summary ?? "drift"}`;
+}
 function short(ref) {
     return ref.replace(/^origin\//, "");
 }
@@ -633,10 +693,17 @@ export function hasDrift(report) {
             return true;
         if (!isErr(t.seeds) && t.seeds.changes > 0)
             return true;
+        for (const d of Object.values(t.probes ?? {}))
+            if (!isErr(d) && !d.clean)
+                return true;
     }
     return false;
 }
 export function hasErrors(report) {
-    return report.targets.some((t) => isErr(t.migrations) || isErr(t.extensions) || isErr(t.config) || isErr(t.seeds));
+    return report.targets.some((t) => isErr(t.migrations) ||
+        isErr(t.extensions) ||
+        isErr(t.config) ||
+        isErr(t.seeds) ||
+        Object.values(t.probes ?? {}).some(isErr));
 }
 //# sourceMappingURL=overview.js.map

@@ -5,6 +5,11 @@ import { readFile } from "node:fs/promises";
 
 export interface TargetsFile {
   targets: Record<string, TargetConfig>;
+  // Repo-declared custom drift checks, run per target by `overview` (#38).
+  // cmd placeholders: {url} → base_url, {token_env} → resolved token env var
+  // name, {target} → target name. The command must print one JSON line:
+  //   { "clean": true|false, "summary": "…" }   (or { "error": "…" })
+  drift_probes?: Array<{ name: string; cmd: string }>;
 }
 
 export interface TargetConfig {

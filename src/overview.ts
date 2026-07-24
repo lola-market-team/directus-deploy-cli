@@ -275,6 +275,11 @@ export interface ChangeSummary {
 
 export type Dimension<T> = T | { error: string };
 
+export interface ProbeSummary {
+  clean: boolean;
+  summary?: string;
+}
+
 export interface TargetOverview {
   target: string;
   ref: string | null; // null = compared against working tree
@@ -282,6 +287,8 @@ export interface TargetOverview {
   extensions: Dimension<ExtensionsSummary>;
   config: Dimension<ChangeSummary>;
   seeds: Dimension<ChangeSummary>;
+  // keyed by probe name; empty object when no drift_probes are declared
+  probes: Record<string, Dimension<ProbeSummary>>;
 }
 
 export interface OverviewReport {
@@ -318,6 +325,7 @@ async function checkTarget(input: {
   layoutRoot: string; // materialized ref dir, or repoRoot for worktree targets
   repoRoot: string;
   targetsFile: string;
+  probes: Array<{ name: string; cmd: string }>;
 }): Promise<TargetOverview> {
   const out: TargetOverview = {
     target: input.name,
@@ -326,6 +334,7 @@ async function checkTarget(input: {
     extensions: { error: "not run" },
     config: { error: "not run" },
     seeds: { error: "not run" },
+    probes: {},
   };
 
   // Extensions need no token — always attempted. Compares deployed source
@@ -429,11 +438,47 @@ async function checkTarget(input: {
     }
   })();
 
-  const [ext, mig, cfg] = await Promise.all([extPromise, migPromise, cfgPromise]);
+  // Custom drift probes (#38): repo-declared commands, run from the ref's
+  // materialized tree so the probe compares against the same snapshot the
+  // other dimensions use. A probe exiting non-zero is fine as long as it
+  // printed the JSON contract (drift is exit 1 by convention).
+  const probesPromise = (async (): Promise<Record<string, Dimension<ProbeSummary>>> => {
+    const res: Record<string, Dimension<ProbeSummary>> = {};
+    await Promise.all(
+      input.probes.map(async (p) => {
+        const cmd = p.cmd
+          .replaceAll("{url}", input.baseUrl)
+          .replaceAll("{token_env}", input.tokenEnv)
+          .replaceAll("{target}", input.name);
+        try {
+          const r = await exec("sh", ["-c", cmd], input.layoutRoot);
+          const lastLine = r.stdout.trim().split("\n").pop() ?? "";
+          let parsed: ProbeSummary & { error?: string };
+          try {
+            parsed = JSON.parse(lastLine) as ProbeSummary & { error?: string };
+          } catch {
+            throw new Error(
+              r.code === 0
+                ? "probe printed no JSON"
+                : `exit ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 200)}`,
+            );
+          }
+          if (parsed.error) throw new Error(parsed.error);
+          res[p.name] = { clean: Boolean(parsed.clean), summary: parsed.summary };
+        } catch (e) {
+          res[p.name] = { error: (e as Error).message };
+        }
+      }),
+    );
+    return res;
+  })();
+
+  const [ext, mig, cfg, probes] = await Promise.all([extPromise, migPromise, cfgPromise, probesPromise]);
   out.extensions = ext;
   out.migrations = mig;
   out.config = cfg.config;
   out.seeds = cfg.seeds;
+  out.probes = probes;
   return out;
 }
 
@@ -515,6 +560,7 @@ export async function runOverview(input: OverviewInput): Promise<OverviewReport>
           extensions: { error },
           config: { error },
           seeds: { error },
+          probes: {},
         };
       }
     }
@@ -526,6 +572,7 @@ export async function runOverview(input: OverviewInput): Promise<OverviewReport>
       layoutRoot,
       repoRoot,
       targetsFile: input.targetsFile,
+      probes: cfg.drift_probes ?? [],
     });
   });
 
@@ -651,6 +698,20 @@ export function renderOverview(report: OverviewReport): string {
     );
   }
 
+  // Custom drift-probe rows (#38) — union of probe names across targets.
+  const probeNames = [...new Set(report.targets.flatMap((t) => Object.keys(t.probes ?? {})))];
+  for (const name of probeNames) {
+    const cells: string[] = [];
+    for (const t of report.targets) {
+      const d = (t.probes ?? {})[name];
+      cells.push(d === undefined ? "—" : cellProbe(d));
+    }
+    if (promo) cells.push("—");
+    lines.push(
+      `  ${name.padEnd(labelWidth - 2)}` + cells.map((c) => c.padEnd(colWidth)).join("").trimEnd(),
+    );
+  }
+
   // Detail block: every red/⚠ cell explains itself.
   const details: string[] = [];
   for (const t of report.targets) {
@@ -672,6 +733,10 @@ export function renderOverview(report: OverviewReport): string {
     else for (const c of truncate(t.config.changeList)) details.push(`✗ ${t.target} config ${c}`);
     if (isErr(t.seeds)) details.push(`⚠ ${t.target} seeds: ${t.seeds.error}`);
     else for (const c of truncate(t.seeds.changeList)) details.push(`✗ ${t.target} seeds ${c}`);
+    for (const [name, d] of Object.entries(t.probes ?? {})) {
+      if (isErr(d)) details.push(`⚠ ${t.target} ${name}: ${d.error}`);
+      else if (!d.clean) details.push(`✗ ${t.target} ${name}: ${d.summary ?? "drift"}`);
+    }
   }
   if (details.length) {
     lines.push("");
@@ -730,6 +795,11 @@ export function renderOverview(report: OverviewReport): string {
   return lines.join("\n");
 }
 
+function cellProbe(d: Dimension<ProbeSummary>): string {
+  if (isErr(d)) return "⚠ error";
+  return d.clean ? "✓ in sync" : `✗ ${d.summary ?? "drift"}`;
+}
+
 function short(ref: string): string {
   return ref.replace(/^origin\//, "");
 }
@@ -764,12 +834,18 @@ export function hasDrift(report: OverviewReport): boolean {
     if (!isErr(t.extensions) && t.extensions.drift > 0) return true;
     if (!isErr(t.config) && t.config.changes > 0) return true;
     if (!isErr(t.seeds) && t.seeds.changes > 0) return true;
+    for (const d of Object.values(t.probes ?? {})) if (!isErr(d) && !d.clean) return true;
   }
   return false;
 }
 
 export function hasErrors(report: OverviewReport): boolean {
   return report.targets.some(
-    (t) => isErr(t.migrations) || isErr(t.extensions) || isErr(t.config) || isErr(t.seeds),
+    (t) =>
+      isErr(t.migrations) ||
+      isErr(t.extensions) ||
+      isErr(t.config) ||
+      isErr(t.seeds) ||
+      Object.values(t.probes ?? {}).some(isErr),
   );
 }
