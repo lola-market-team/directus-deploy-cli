@@ -50,6 +50,32 @@ Below the matrix, the promotion block is a release preview: the queued commit li
 
 Exit codes: `0` in sync, `1` drift, `2` a check could not run. `--json` emits the full report (untruncated detail lists) for dashboards or Slack bots.
 
+### Custom drift probes
+
+Repos have drift surfaces the CLI can't know about (externally-managed data pipelines, computed caches). Declare them in the targets file and `overview` grows a row per probe:
+
+```json
+"drift_probes": [
+  { "name": "attributes", "cmd": "node scripts/attributes-drift.mjs --url {url} --token-env {token_env} --json" }
+]
+```
+
+The command runs once per target from the working tree (`{url}`, `{token_env}`, `{target}` substituted) and must print one JSON line: `{ "clean": true|false, "summary": "…" }`. Probe drift counts as drift; probe failures as errors.
+
+## Seeds
+
+Data tables managed as code: `directus_config/seed/<collection>.json` files in the Tractr shape (`{collection, meta, data}`), applied row-by-row keyed on the collection's real primary key. The reconciler compares only the columns present in the seed rows — runtime columns stay untouched — and fetches exactly those columns (a pgvector column won't blow up your instance).
+
+```bash
+directus-deploy seeds pull categories \
+  --fields id,parent_id,code,title,status --insert-order 50   # bootstrap/refresh from a live env
+directus-deploy apply --entities seeds                        # converge an env
+directus-deploy apply --entities seeds --prune                # also DELETE server rows absent from
+                                                              # seeds with meta.delete=true
+```
+
+`seeds pull` preserves an existing file's `meta`, derives the field list from the file on re-pulls, orders parents before children (self-referencing FKs survive fresh-env inserts), and hard-errors on duplicate PKs. Server rows absent from a seed are reported: aggregated and informational for `meta.delete: false` collections, per-row `EXTRA` (verify fails) for `meta.delete: true` — `apply --prune` deletes those, children-first.
+
 ## Extension deploy model
 
 One rule: **new builds enter only at test; staging and prod replay the archive.**
