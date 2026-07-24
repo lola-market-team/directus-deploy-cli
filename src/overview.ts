@@ -798,7 +798,10 @@ export function renderOverview(report: OverviewReport): string {
 
 function cellProbe(d: Dimension<ProbeSummary>): string {
   if (isErr(d)) return "⚠ error";
-  return d.clean ? "✓ in sync" : `✗ ${d.summary ?? "drift"}`;
+  if (d.clean) return "✓ in sync";
+  // Cell must fit the matrix column — the detail block carries the full text.
+  const s = d.summary ?? "drift";
+  return `✗ ${s.length > 15 ? s.slice(0, 14) + "…" : s}`;
 }
 
 function short(ref: string): string {

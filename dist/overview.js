@@ -307,10 +307,11 @@ async function checkTarget(input) {
             return { config: { error }, seeds: { error } };
         }
     })();
-    // Custom drift probes (#38): repo-declared commands, run from the ref's
-    // materialized tree so the probe compares against the same snapshot the
-    // other dimensions use. A probe exiting non-zero is fine as long as it
-    // printed the JSON contract (drift is exit 1 by convention).
+    // Custom drift probes (#38): repo-declared commands, run from the WORKING
+    // TREE (repoRoot) — probes compare the env against the repo's current
+    // committed state, and the probe script itself may not exist at older refs.
+    // A probe exiting non-zero is fine as long as it printed the JSON contract
+    // (drift is exit 1 by convention).
     const probesPromise = (async () => {
         const res = {};
         await Promise.all(input.probes.map(async (p) => {
@@ -319,7 +320,7 @@ async function checkTarget(input) {
                 .replaceAll("{token_env}", input.tokenEnv)
                 .replaceAll("{target}", input.name);
             try {
-                const r = await exec("sh", ["-c", cmd], input.layoutRoot);
+                const r = await exec("sh", ["-c", cmd], input.repoRoot);
                 const lastLine = r.stdout.trim().split("\n").pop() ?? "";
                 let parsed;
                 try {
