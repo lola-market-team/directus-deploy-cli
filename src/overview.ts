@@ -426,10 +426,10 @@ async function checkTarget(input: {
       const config: ChangeSummary = { changes: 0, changeList: [] };
       const seeds: ChangeSummary = { changes: 0, changeList: [] };
       for (const r of report.results) {
-        if (r.action !== "created" && r.action !== "updated") continue;
+        if (r.action !== "created" && r.action !== "updated" && r.action !== "extra") continue;
         const bucket = r.kind === "seeds" ? seeds : config;
         bucket.changes++;
-        bucket.changeList.push(`${r.action === "created" ? "+" : "~"} ${r.label}`);
+        bucket.changeList.push(`${r.action === "created" ? "+" : r.action === "extra" ? "!" : "~"} ${r.label}`);
       }
       return { config, seeds };
     } catch (e) {

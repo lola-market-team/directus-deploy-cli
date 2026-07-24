@@ -42,6 +42,8 @@ export function summarize(results: EntityResult[], target: string): RunReport {
     unchanged: 0,
     skipped: 0,
     failed: 0,
+    extra: 0,
+    deleted: 0,
   };
   for (const r of results) counts[r.action] += 1;
   return { target, results, counts };

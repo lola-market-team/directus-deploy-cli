@@ -221,3 +221,66 @@ describe("reconcileSeeds fields restriction (#37)", () => {
     expect(fields.split(",").sort()).toEqual(["code", "id", "title"]);
   });
 });
+
+describe("server extras + prune (#36)", () => {
+  const idPk = [
+    { collection: "messaging_templates", field: "id", type: "integer", schema: { is_primary_key: true } },
+  ];
+  const seedBody = (meta) => ({
+    "messaging_templates.json": {
+      collection: "messaging_templates",
+      meta,
+      data: [{ id: 1, subject: "keep" }],
+    },
+  });
+  const serverRows = [{ id: 1, subject: "keep" }, { id: 2, subject: "stale" }];
+
+  it("meta.delete unset → one aggregated skipped result, nothing deleted", async () => {
+    const seedDir = await writeSeedDir(seedBody({ preserve_ids: true }));
+    const client = mockClient({ fieldsByCollection: { messaging_templates: idPk }, itemsByCollection: { messaging_templates: serverRows } });
+    const results = await reconcileSeeds({ seedDir, client, opts: { dryRun: true } });
+    expect(results).toContainEqual({
+      kind: "seeds",
+      label: "seeds/messaging_templates",
+      action: "skipped",
+      reason: "1 server row(s) not in seed (meta.delete not enabled)",
+    });
+    expect(client.delete).not.toHaveBeenCalled();
+  });
+
+  it("meta.delete=true without --prune → per-row 'extra', nothing deleted", async () => {
+    const seedDir = await writeSeedDir(seedBody({ preserve_ids: true, delete: true }));
+    const client = mockClient({ fieldsByCollection: { messaging_templates: idPk }, itemsByCollection: { messaging_templates: serverRows } });
+    const results = await reconcileSeeds({ seedDir, client, opts: { dryRun: true } });
+    expect(results).toContainEqual({
+      kind: "seeds",
+      label: "seeds/messaging_templates[2]",
+      action: "extra",
+      reason: "server row not in seed — apply --prune to delete",
+    });
+    expect(client.delete).not.toHaveBeenCalled();
+  });
+
+  it("meta.delete=true + prune → DELETEs the extra row", async () => {
+    const seedDir = await writeSeedDir(seedBody({ preserve_ids: true, delete: true }));
+    const client = mockClient({ fieldsByCollection: { messaging_templates: idPk }, itemsByCollection: { messaging_templates: serverRows } });
+    const results = await reconcileSeeds({ seedDir, client, opts: { dryRun: false, prune: true } });
+    expect(results).toContainEqual({ kind: "seeds", label: "seeds/messaging_templates[2]", action: "deleted" });
+    expect(client.delete).toHaveBeenCalledWith("/items/messaging_templates/2");
+  });
+
+  it("prune + dryRun reports deletions without executing", async () => {
+    const seedDir = await writeSeedDir(seedBody({ preserve_ids: true, delete: true }));
+    const client = mockClient({ fieldsByCollection: { messaging_templates: idPk }, itemsByCollection: { messaging_templates: serverRows } });
+    const results = await reconcileSeeds({ seedDir, client, opts: { dryRun: true, prune: true } });
+    expect(results).toContainEqual({ kind: "seeds", label: "seeds/messaging_templates[2]", action: "deleted" });
+    expect(client.delete).not.toHaveBeenCalled();
+  });
+
+  it("no extras → no extra/deleted/skip noise", async () => {
+    const seedDir = await writeSeedDir(seedBody({ preserve_ids: true, delete: true }));
+    const client = mockClient({ fieldsByCollection: { messaging_templates: idPk }, itemsByCollection: { messaging_templates: [{ id: 1, subject: "keep" }] } });
+    const results = await reconcileSeeds({ seedDir, client, opts: { dryRun: true } });
+    expect(results.map((r) => r.action)).toEqual(["unchanged"]);
+  });
+});

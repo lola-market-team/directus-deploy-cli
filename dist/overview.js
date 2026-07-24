@@ -294,11 +294,11 @@ async function checkTarget(input) {
             const config = { changes: 0, changeList: [] };
             const seeds = { changes: 0, changeList: [] };
             for (const r of report.results) {
-                if (r.action !== "created" && r.action !== "updated")
+                if (r.action !== "created" && r.action !== "updated" && r.action !== "extra")
                     continue;
                 const bucket = r.kind === "seeds" ? seeds : config;
                 bucket.changes++;
-                bucket.changeList.push(`${r.action === "created" ? "+" : "~"} ${r.label}`);
+                bucket.changeList.push(`${r.action === "created" ? "+" : r.action === "extra" ? "!" : "~"} ${r.label}`);
             }
             return { config, seeds };
         }
@@ -655,7 +655,11 @@ export function renderOverview(report) {
 function cellProbe(d) {
     if (isErr(d))
         return "⚠ error";
-    return d.clean ? "✓ in sync" : `✗ ${d.summary ?? "drift"}`;
+    if (d.clean)
+        return "✓ in sync";
+    // Cell must fit the matrix column — the detail block carries the full text.
+    const s = d.summary ?? "drift";
+    return `✗ ${s.length > 15 ? s.slice(0, 14) + "…" : s}`;
 }
 function short(ref) {
     return ref.replace(/^origin\//, "");

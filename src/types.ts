@@ -13,7 +13,7 @@ export type EntityKind =
 export interface EntityResult {
   kind: EntityKind;
   label: string; // e.g. "collections/listings", "fields/listings.title"
-  action: "created" | "updated" | "unchanged" | "skipped" | "failed";
+  action: "created" | "updated" | "unchanged" | "skipped" | "failed" | "extra" | "deleted";
   reason?: string; // human-readable, especially for skipped/failed
 }
 
@@ -37,4 +37,7 @@ export interface DirectusClient {
 export interface ApplyOptions {
   dryRun: boolean;
   onlyCollections?: Set<string>;
+  // Seeds only (#36): DELETE server rows absent from the seed, for
+  // collections whose seed sets meta.delete=true. Off by default.
+  prune?: boolean;
 }

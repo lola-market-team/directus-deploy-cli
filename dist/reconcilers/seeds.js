@@ -15,10 +15,11 @@ import { diffSubset, formatDiffPath } from "../diff.js";
 // from /fields/<collection> (schema.is_primary_key) and falling back to `id`
 // when unresolvable (#32 — `notification_types` keys on `key`, not `id`).
 // `_sync_id` is Tractr's own namespace and gets stripped before writes.
-// Additive-only in v0: `delete` is
-// honoured for the read side (server extras aren't flagged as drift) but
-// nothing is DELETEd. If you need to remove a seed row, delete it from git
-// AND from the server manually until we add a `--prune` flag.
+// Deletion (#36): server rows absent from the seed are reported. For
+// collections with meta.delete=true they surface as action "extra" (verify
+// fails on them) and `apply --prune` DELETEs them, children-first (reverse
+// insert_order). With meta.delete unset/false they surface as one aggregated
+// "skipped" result per collection — visible, never drift, never deleted.
 const SERVER_ONLY_SEED_KEYS = new Set([
     "_sync_id",
     "date_created",
@@ -213,6 +214,81 @@ export async function reconcileSeeds(input) {
             else {
                 results.push({ kind: "seeds", label, action: "unchanged" });
             }
+        }
+    }
+    const byCollection = new Map();
+    for (const file of files) {
+        const pk = await resolvePrimaryKey(input.client, file.collection, pkCache);
+        let c = byCollection.get(file.collection);
+        if (!c) {
+            c = {
+                collection: file.collection,
+                pk,
+                seedPks: new Set(),
+                deleteEnabled: false,
+                insertOrder: file.meta?.insert_order ?? 0,
+            };
+            byCollection.set(file.collection, c);
+        }
+        if (file.meta?.delete === true)
+            c.deleteEnabled = true;
+        c.insertOrder = Math.max(c.insertOrder, file.meta?.insert_order ?? 0);
+        for (const row of file.data ?? []) {
+            const id = row[pk];
+            if (id !== undefined && id !== null)
+                c.seedPks.add(String(id));
+        }
+    }
+    const collections = [...byCollection.values()].sort((a, b) => b.insertOrder - a.insertOrder);
+    for (const c of collections) {
+        let server;
+        try {
+            server = await listServer(input.client, c.collection, [c.pk]);
+        }
+        catch (e) {
+            results.push({
+                kind: "seeds",
+                label: `seeds/${c.collection}`,
+                action: "failed",
+                reason: `extras check: ${e.message}`,
+            });
+            continue;
+        }
+        const extras = server
+            .map((r) => r[c.pk])
+            .filter((v) => v !== undefined && v !== null && !c.seedPks.has(String(v)));
+        if (extras.length === 0)
+            continue;
+        if (!c.deleteEnabled) {
+            results.push({
+                kind: "seeds",
+                label: `seeds/${c.collection}`,
+                action: "skipped",
+                reason: `${extras.length} server row(s) not in seed (meta.delete not enabled)`,
+            });
+            continue;
+        }
+        for (const id of extras) {
+            const label = `seeds/${c.collection}[${String(id)}]`;
+            if (!input.opts.prune) {
+                results.push({
+                    kind: "seeds",
+                    label,
+                    action: "extra",
+                    reason: "server row not in seed — apply --prune to delete",
+                });
+                continue;
+            }
+            if (!input.opts.dryRun) {
+                try {
+                    await input.client.delete(`/items/${c.collection}/${encodeURIComponent(String(id))}`);
+                }
+                catch (e) {
+                    results.push({ kind: "seeds", label, action: "failed", reason: e.message });
+                    continue;
+                }
+            }
+            results.push({ kind: "seeds", label, action: "deleted" });
         }
     }
     return results;

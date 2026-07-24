@@ -18,6 +18,8 @@ export function summarize(results, target) {
         unchanged: 0,
         skipped: 0,
         failed: 0,
+        extra: 0,
+        deleted: 0,
     };
     for (const r of results)
         counts[r.action] += 1;

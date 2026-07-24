@@ -7,9 +7,9 @@ export function formatHuman(report: RunReport): string {
     const suffix = r.reason ? ` — ${r.reason}` : "";
     lines.push(`  ${r.action.toUpperCase().padEnd(9)} ${r.label}${suffix}`);
   }
-  const { created, updated, unchanged, skipped, failed } = report.counts;
+  const { created, updated, unchanged, skipped, failed, extra = 0, deleted = 0 } = report.counts;
   lines.push(
-    `\n${created} created, ${updated} updated, ${unchanged} unchanged, ${skipped} skipped, ${failed} failed  (target: ${report.target})`,
+    `\n${created} created, ${updated} updated, ${deleted} deleted, ${extra} extra, ${unchanged} unchanged, ${skipped} skipped, ${failed} failed  (target: ${report.target})`,
   );
   return lines.join("\n");
 }

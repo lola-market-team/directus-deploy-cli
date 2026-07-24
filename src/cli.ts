@@ -174,13 +174,14 @@ function readCommon(flags: CommonFlags): {
 
 interface ExecuteOptions {
   dryRun: boolean;
-  strict?: boolean; // verify mode — any created/updated is a failure
+  strict?: boolean; // verify mode — any created/updated/extra is a failure
+  prune?: boolean;  // seeds only (#36): delete server extras where meta.delete=true
 }
 
 async function execute(mode: ExecuteOptions, flags: CommonFlags): Promise<number> {
   const common = readCommon(flags);
   const client = createDirectusClient({ baseUrl: common.url, token: common.token });
-  const opts: ApplyOptions = { dryRun: mode.dryRun, onlyCollections: common.onlyCollections };
+  const opts: ApplyOptions = { dryRun: mode.dryRun, onlyCollections: common.onlyCollections, prune: mode.prune };
   const report = await run({
     target: common.target,
     paths: {
@@ -206,9 +207,10 @@ async function execute(mode: ExecuteOptions, flags: CommonFlags): Promise<number
     // Verify: any drift (created/updated) means the target didn't match git.
     // `skipped` is intentional (adopted-but-unregistered raw-SQL columns,
     // register-manifest collections) — never treated as drift.
-    if (report.counts.created > 0 || report.counts.updated > 0) {
+    const extras = report.counts.extra ?? 0;
+    if (report.counts.created > 0 || report.counts.updated > 0 || extras > 0) {
       process.stderr.write(
-        `verify: drift detected (${report.counts.created} would-create, ${report.counts.updated} would-update)\n`,
+        `verify: drift detected (${report.counts.created} would-create, ${report.counts.updated} would-update, ${extras} server-extra)\n`,
       );
       return 1;
     }
@@ -404,9 +406,13 @@ attachCommon(program.command("apply"))
     "--no-verify",
     "skip the post-apply verify pass (default: run verify after apply, exit non-zero on residual drift)",
   )
+  .option(
+    "--prune",
+    "seeds: DELETE server rows absent from the seed for collections with meta.delete=true (#36)",
+  )
   .action(async (_, cmd) => {
-    const flags = cmd.optsWithGlobals() as CommonFlags & { verify?: boolean };
-    const applyExit = await execute({ dryRun: false }, flags);
+    const flags = cmd.optsWithGlobals() as CommonFlags & { verify?: boolean; prune?: boolean };
+    const applyExit = await execute({ dryRun: false, prune: flags.prune }, flags);
     if (applyExit !== 0) process.exit(applyExit);
     // commander's --no-<flag> sets `verify: false`; default (`verify` absent
     // or true) means run the post-apply verify.
@@ -786,7 +792,7 @@ migrationsGroup
       client,
       opts: { dryRun: Boolean(opts.dryRun) },
     });
-    const counts = { created: 0, updated: 0, unchanged: 0, skipped: 0, failed: 0 };
+    const counts = { created: 0, updated: 0, unchanged: 0, skipped: 0, failed: 0, extra: 0, deleted: 0 };
     for (const r of results) counts[r.action] += 1;
     const report = { target, results, counts };
     if (opts.json) {
