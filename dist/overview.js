@@ -5,19 +5,89 @@ import { join, resolve } from "node:path";
 import { createDirectusClient } from "./http.js";
 import { run } from "./runner.js";
 import { diffExtensions, loadTargets } from "./extensions.js";
-function exec(cmd, args, cwd) {
+// Per-check deadline. Applies to every leg of a target check — git, HTTP
+// reconcilers, and drift probes alike. 0 disables. See #39: before this, one
+// wedged leg blocked the whole command with no output and no upper bound.
+//
+// 5 minutes, not 1: the `config` leg legitimately takes ~70s per target
+// (measured against staging + prod), while every other leg finishes inside 4s.
+// A tighter ceiling would turn a normal slow day into a spurious TIMEOUT. The
+// fine-grained bound lives one level down, in the HTTP client's per-request
+// timeout and retry-elapsed ceiling — this is only the backstop.
+export const OVERVIEW_TIMEOUT_MS = 300_000;
+function isTimeout(e) {
+    return Boolean(e) && e.timeout === true;
+}
+function timeoutErr(label, ms) {
+    const e = new Error(`${label} timed out after ${ms}ms`);
+    e.timeout = true;
+    return e;
+}
+// Races `work` against a deadline. The underlying work is NOT cancelled (it is
+// a reconciler mid-flight); the CLI process.exit()s and the MCP path lets it
+// settle unobserved. What matters is that the caller stops waiting.
+async function withDeadline(label, ms, work) {
+    if (ms <= 0)
+        return work;
+    let timer;
+    try {
+        return await Promise.race([
+            work,
+            new Promise((_, rej) => {
+                timer = setTimeout(() => rej(timeoutErr(label, ms)), ms);
+                timer.unref?.();
+            }),
+        ]);
+    }
+    finally {
+        if (timer)
+            clearTimeout(timer);
+    }
+}
+function exec(cmd, args, cwd, timeoutMs = 0) {
     return new Promise((res, rej) => {
-        const child = spawn(cmd, args, { cwd });
+        // `detached` puts the child in its own process group so the deadline can
+        // kill the whole tree. Killing the child pid alone is not enough: probes
+        // run as `sh -c "<cmd>"`, and sh only exec-replaces itself for a SINGLE
+        // command — `a | b` or `cd x && a` leaves the real worker as a grandchild
+        // that survives the kill and keeps holding its connection to the target.
+        const child = spawn(cmd, args, { cwd, detached: timeoutMs > 0 });
         let stdout = "";
         let stderr = "";
+        let timer;
+        if (timeoutMs > 0) {
+            timer = setTimeout(() => {
+                try {
+                    // Negative pid = the whole process group.
+                    if (child.pid)
+                        process.kill(-child.pid, "SIGKILL");
+                }
+                catch {
+                    // Group already gone (ESRCH) — fall back to the direct child.
+                    try {
+                        child.kill("SIGKILL");
+                    }
+                    catch { /* already dead */ }
+                }
+                rej(timeoutErr(`${cmd} ${args[0] ?? ""}`.trim(), timeoutMs));
+            }, timeoutMs);
+            timer.unref?.();
+        }
         child.stdout.on("data", (d) => (stdout += d.toString()));
         child.stderr.on("data", (d) => (stderr += d.toString()));
-        child.on("error", (e) => rej(e));
-        child.on("close", (code) => res({ code: code ?? -1, stdout, stderr }));
+        child.on("error", (e) => { if (timer)
+            clearTimeout(timer); rej(e); });
+        child.on("close", (code) => {
+            if (timer)
+                clearTimeout(timer);
+            res({ code: code ?? -1, stdout, stderr });
+        });
     });
 }
-async function git(repoRoot, args) {
-    const r = await exec("git", ["-C", repoRoot, ...args]);
+// git is bounded too: `fetch`/`rev-parse` against an unreachable remote hangs
+// on TCP timeout, which is a hang the caller cannot distinguish from work.
+async function git(repoRoot, args, timeoutMs = OVERVIEW_TIMEOUT_MS) {
+    const r = await exec("git", ["-C", repoRoot, ...args], undefined, timeoutMs);
     if (r.code !== 0) {
         throw new Error(`git ${args[0]} failed: ${r.stderr.trim() || r.stdout.trim()}`);
     }
@@ -77,8 +147,11 @@ export function classifyPromotionPaths(entries) {
         seeds: seeds.sort(),
     };
 }
-export async function computePromotionQueue(repoRoot, from, to) {
-    const ahead = Number((await git(repoRoot, ["rev-list", "--count", `${to}..${from}`])).trim());
+export async function computePromotionQueue(repoRoot, from, to, timeoutMs = OVERVIEW_TIMEOUT_MS) {
+    // Bound every git invocation to the caller's deadline, so `--timeout 0`
+    // genuinely disables rather than silently leaving git on its own default.
+    const g = (args) => git(repoRoot, args, timeoutMs);
+    const ahead = Number((await g(["rev-list", "--count", `${to}..${from}`])).trim());
     // Behind answers "does `to` hold CONTENT that `from` lacks" — the thing the
     // next release would clobber. Raw SHA counting inflates it with (a) the
     // merge commit every release PR mints on `to`, one per release forever, and
@@ -87,7 +160,7 @@ export async function computePromotionQueue(repoRoot, from, to) {
     // --no-merges drops merge commits (they have no patch-id and would always
     // count). What's left is genuinely missing from `from` — a back-port that
     // needed even one line of conflict resolution still counts, correctly.
-    const behind = Number((await git(repoRoot, [
+    const behind = Number((await g([
         "rev-list",
         "--count",
         "--right-only",
@@ -95,7 +168,7 @@ export async function computePromotionQueue(repoRoot, from, to) {
         "--no-merges",
         `${from}...${to}`,
     ])).trim());
-    const raw = await git(repoRoot, [
+    const raw = await g([
         "diff",
         "--name-status",
         "--no-renames",
@@ -115,7 +188,7 @@ export async function computePromotionQueue(repoRoot, from, to) {
         return { status: status.charAt(0), path: rest.join("\t") };
     });
     const classified = classifyPromotionPaths(entries);
-    const commits = parseCommitLog(await git(repoRoot, ["log", "--format=%h%x09%s", "-n", String(COMMIT_LIST_CAP), `${to}..${from}`]));
+    const commits = parseCommitLog(await g(["log", "--format=%h%x09%s", "-n", String(COMMIT_LIST_CAP), `${to}..${from}`]));
     const extensionDetails = [];
     for (const name of classified.extensions) {
         // Same pathspec as resolveArtifactSourceCommit — the bucket filename /
@@ -128,14 +201,14 @@ export async function computePromotionQueue(repoRoot, from, to) {
         ];
         let expected = null;
         try {
-            expected = (await git(repoRoot, ["log", "-1", "--format=%h", from, ...pathspec])).trim() || null;
+            expected = (await g(["log", "-1", "--format=%h", from, ...pathspec])).trim() || null;
         }
         catch {
             // ref vanished mid-run or pathspec quirk — detail row still renders
         }
         let extCommits = [];
         try {
-            extCommits = parseCommitLog(await git(repoRoot, ["log", "--format=%h%x09%s", "-n", String(COMMIT_LIST_CAP), `${to}..${from}`, ...pathspec]));
+            extCommits = parseCommitLog(await g(["log", "--format=%h%x09%s", "-n", String(COMMIT_LIST_CAP), `${to}..${from}`, ...pathspec]));
         }
         catch {
             // same — leave the commit list empty rather than dropping the row
@@ -157,11 +230,13 @@ export async function computePromotionQueue(repoRoot, from, to) {
 // Extract the deployable dirs at a ref into a temp dir so the file-reading
 // reconcilers see the branch's state instead of the working tree. `extensions`
 // is included because the migrations reconciler scans extensions/*/migrations.
-async function materializeRef(repoRoot, ref) {
+async function materializeRef(repoRoot, ref, timeoutMs = OVERVIEW_TIMEOUT_MS) {
     const dir = await mkdtemp(join(tmpdir(), "dd-overview-"));
     const quote = (s) => `'${s.replace(/'/g, "'\\''")}'`;
+    // A pipeline, so sh cannot exec-replace itself — without a deadline here the
+    // git and tar processes outlive an abandoned check entirely.
     const cmd = `git -C ${quote(repoRoot)} archive ${quote(ref)} directus_config migrations extensions | tar -xf - -C ${quote(dir)}`;
-    const r = await exec("sh", ["-c", cmd]);
+    const r = await exec("sh", ["-c", cmd], undefined, timeoutMs);
     if (r.code !== 0) {
         await rm(dir, { recursive: true, force: true });
         throw new Error(`could not materialize ${ref}: ${r.stderr.trim() || r.stdout.trim()} (is the ref fetched?)`);
@@ -187,6 +262,33 @@ const LAYOUT = {
     extensionsDir: "extensions",
 };
 async function checkTarget(input) {
+    // Every leg reports start/finish and is bounded by the same deadline. A leg
+    // that trips it becomes a TIMEOUT cell (an error, so exit 2) instead of
+    // stalling the run.
+    const track = async (stage, run, describe) => {
+        input.onProgress?.({ target: input.name, stage, status: "start" });
+        const t0 = Date.now();
+        try {
+            const v = await withDeadline(`${input.name} ${stage}`, input.timeoutMs, run());
+            const detail = describe(v);
+            const err = v?.error;
+            input.onProgress?.({
+                target: input.name, stage,
+                status: err ? "error" : "ok",
+                ms: Date.now() - t0, detail: err ?? detail,
+            });
+            return v;
+        }
+        catch (e) {
+            const message = e.message;
+            input.onProgress?.({
+                target: input.name, stage,
+                status: isTimeout(e) ? "timeout" : "error",
+                ms: Date.now() - t0, detail: message,
+            });
+            return { error: isTimeout(e) ? `TIMEOUT ${message}` : message };
+        }
+    };
     const out = {
         target: input.name,
         ref: input.ref,
@@ -198,7 +300,7 @@ async function checkTarget(input) {
     };
     // Extensions need no token — always attempted. Compares deployed source
     // tree hash against the target's ref (worktree targets compare vs HEAD).
-    const extPromise = (async () => {
+    const extPromise = track("extensions", async () => {
         try {
             const report = await diffExtensions({
                 targetsFile: input.targetsFile,
@@ -227,9 +329,11 @@ async function checkTarget(input) {
             return summary;
         }
         catch (e) {
+            if (isTimeout(e))
+                throw e; // render TIMEOUT, not a generic error
             return { error: e.message };
         }
-    })();
+    }, (v) => isErr(v) ? undefined : `${v.match} match, ${v.drift} drift, ${v.missing} missing`);
     const token = process.env[input.tokenEnv];
     if (!token) {
         const error = `${input.tokenEnv} not set`;
@@ -241,7 +345,7 @@ async function checkTarget(input) {
     }
     const client = createDirectusClient({ baseUrl: input.baseUrl, token });
     const p = (rel) => join(input.layoutRoot, rel);
-    const migPromise = (async () => {
+    const migPromise = track("migrations", async () => {
         try {
             const { reconcileMigrations } = await import("./reconcilers/migrations.js");
             const results = await reconcileMigrations({
@@ -271,10 +375,12 @@ async function checkTarget(input) {
             return s;
         }
         catch (e) {
+            if (isTimeout(e))
+                throw e; // render TIMEOUT, not a generic error
             return { error: e.message };
         }
-    })();
-    const cfgPromise = (async () => {
+    }, (v) => isErr(v) ? undefined : `${v.applied} applied, ${v.pending} pending, ${v.mutated} mutated`);
+    const cfgPromise = track("config", async () => {
         try {
             const report = await run({
                 target: input.name,
@@ -303,10 +409,14 @@ async function checkTarget(input) {
             return { config, seeds };
         }
         catch (e) {
+            if (isTimeout(e))
+                throw e; // render TIMEOUT, not a generic error
             const error = e.message;
             return { config: { error }, seeds: { error } };
         }
-    })();
+    }, (v) => "config" in v && !isErr(v.config) && !isErr(v.seeds)
+        ? `${v.config.changes} config, ${v.seeds.changes} seed changes`
+        : undefined);
     // Custom drift probes (#38): repo-declared commands, run from the WORKING
     // TREE (repoRoot) — probes compare the env against the repo's current
     // committed state, and the probe script itself may not exist at older refs.
@@ -319,33 +429,44 @@ async function checkTarget(input) {
                 .replaceAll("{url}", input.baseUrl)
                 .replaceAll("{token_env}", input.tokenEnv)
                 .replaceAll("{target}", input.name);
-            try {
-                const r = await exec("sh", ["-c", cmd], input.repoRoot);
-                const lastLine = r.stdout.trim().split("\n").pop() ?? "";
-                let parsed;
+            // Tracked individually — probes are repo-supplied commands and are the
+            // most likely thing to be slow, so "which probe" is the useful signal.
+            const tracked = await track(`probe:${p.name}`, async () => {
                 try {
-                    parsed = JSON.parse(lastLine);
+                    const r = await exec("sh", ["-c", cmd], input.repoRoot, input.timeoutMs);
+                    const lastLine = r.stdout.trim().split("\n").pop() ?? "";
+                    let parsed;
+                    try {
+                        parsed = JSON.parse(lastLine);
+                    }
+                    catch {
+                        throw new Error(r.code === 0
+                            ? "probe printed no JSON"
+                            : `exit ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 200)}`);
+                    }
+                    if (parsed.error)
+                        throw new Error(parsed.error);
+                    return { clean: Boolean(parsed.clean), summary: parsed.summary };
                 }
-                catch {
-                    throw new Error(r.code === 0
-                        ? "probe printed no JSON"
-                        : `exit ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 200)}`);
+                catch (e) {
+                    // A deadline is not a probe failure — let it reach track() so the
+                    // cell renders TIMEOUT rather than an ordinary probe error.
+                    if (isTimeout(e))
+                        throw e;
+                    return { error: e.message };
                 }
-                if (parsed.error)
-                    throw new Error(parsed.error);
-                res[p.name] = { clean: Boolean(parsed.clean), summary: parsed.summary };
-            }
-            catch (e) {
-                res[p.name] = { error: e.message };
-            }
+            }, (v) => (isErr(v) ? undefined : (v.summary ?? (v.clean ? "clean" : "drift"))));
+            res[p.name] = tracked;
         }));
         return res;
     })();
     const [ext, mig, cfg, probes] = await Promise.all([extPromise, migPromise, cfgPromise, probesPromise]);
     out.extensions = ext;
     out.migrations = mig;
-    out.config = cfg.config;
-    out.seeds = cfg.seeds;
+    // config and seeds share one reconcile pass, so a timeout on that pass fails
+    // both cells rather than leaving them at the "not run" placeholder.
+    out.config = "config" in cfg ? cfg.config : cfg;
+    out.seeds = "config" in cfg ? cfg.seeds : cfg;
     out.probes = probes;
     return out;
 }
@@ -380,6 +501,7 @@ export function resolvePromotionPair(probed, all) {
 }
 export async function runOverview(input) {
     const repoRoot = resolve(input.repoRoot);
+    const timeoutMs = input.timeoutMs ?? OVERVIEW_TIMEOUT_MS;
     const cfg = await loadTargets(input.targetsFile);
     const names = input.targets?.length ? input.targets : Object.keys(cfg.targets);
     const missing = names.filter((n) => !cfg.targets[n]);
@@ -390,7 +512,7 @@ export async function runOverview(input) {
     const materialized = (ref) => {
         let p = matCache.get(ref);
         if (!p) {
-            p = materializeRef(repoRoot, ref);
+            p = materializeRef(repoRoot, ref, timeoutMs);
             matCache.set(ref, p);
         }
         return p;
@@ -401,9 +523,17 @@ export async function runOverview(input) {
         let layoutRoot = repoRoot;
         if (ref) {
             try {
-                layoutRoot = await materialized(ref);
+                input.onProgress?.({ target: name, stage: "materialize", status: "start", detail: ref });
+                const t0 = Date.now();
+                layoutRoot = await withDeadline(`${name} materialize`, timeoutMs, materialized(ref));
+                input.onProgress?.({ target: name, stage: "materialize", status: "ok", ms: Date.now() - t0, detail: ref });
             }
             catch (e) {
+                input.onProgress?.({
+                    target: name, stage: "materialize",
+                    status: isTimeout(e) ? "timeout" : "error",
+                    detail: e.message,
+                });
                 const error = e.message;
                 return {
                     target: name,
@@ -425,6 +555,8 @@ export async function runOverview(input) {
             repoRoot,
             targetsFile: input.targetsFile,
             probes: cfg.drift_probes ?? [],
+            onProgress: input.onProgress,
+            timeoutMs,
         });
     });
     let promotion = null;
@@ -448,10 +580,18 @@ export async function runOverview(input) {
             promotionSkipped = pair.skipped;
             return;
         }
+        input.onProgress?.({ target: "repo", stage: "promotion", status: "start", detail: `${pair.from} → ${pair.to}` });
+        const t0 = Date.now();
         try {
-            promotion = await computePromotionQueue(repoRoot, pair.from, pair.to);
+            promotion = await withDeadline("promotion queue", timeoutMs, computePromotionQueue(repoRoot, pair.from, pair.to, timeoutMs));
+            input.onProgress?.({ target: "repo", stage: "promotion", status: "ok", ms: Date.now() - t0 });
         }
         catch (e) {
+            input.onProgress?.({
+                target: "repo", stage: "promotion",
+                status: isTimeout(e) ? "timeout" : "error",
+                ms: Date.now() - t0, detail: e.message,
+            });
             promotionSkipped = pair.fallback
                 ? `${pair.fallback}; fallback ${pair.from} → ${pair.to} failed: ${e.message}`
                 : e.message;

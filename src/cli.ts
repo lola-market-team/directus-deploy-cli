@@ -664,6 +664,16 @@ program
   .option("--from <ref>", "promotion queue source ref (default: inferred from target refs)")
   .option("--to <ref>", "promotion queue destination ref (default: inferred from target refs)")
   .option("--json", "emit JSON report instead of the matrix")
+  .option(
+    "--progress <mode>",
+    "per-check progress on stderr: auto (currently identical to plain) | plain | none",
+    "auto",
+  )
+  .option(
+    "--timeout <ms>",
+    "per-check deadline; a check that exceeds it renders TIMEOUT and exits 2. 0 disables",
+    String(300_000),
+  )
   .action(async (opts: {
     targetsFile: string;
     targets?: string;
@@ -671,22 +681,57 @@ program
     from?: string;
     to?: string;
     json?: boolean;
+    progress: string;
+    timeout: string;
   }) => {
     const { runOverview, renderOverview, hasDrift, hasErrors } = await import("./overview.js");
+
+    if (!["auto", "plain", "none"].includes(opts.progress)) {
+      process.stderr.write(`--progress must be auto|plain|none (got "${opts.progress}")\n`);
+      process.exit(2);
+    }
+    const timeoutMs = Number(opts.timeout);
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+      process.stderr.write(`--timeout must be a non-negative number of ms (got "${opts.timeout}")\n`);
+      process.exit(2);
+    }
+    // `auto` resolves to plain — including, and especially, when stdout is not
+    // a TTY, which is the piped/CI/agent case that made a long run
+    // indistinguishable from a deadlock (#39). No spinner variant: one line per
+    // completed check reads correctly both interactively and in a log.
+    const progress = opts.progress === "auto" ? "plain" : opts.progress;
+
     const report = await runOverview({
       targetsFile: opts.targetsFile,
       repoRoot: opts.repoRoot,
       targets: opts.targets ? opts.targets.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
       from: opts.from,
       to: opts.to,
+      timeoutMs,
+      // stderr keeps stdout clean for --json and for piping into other tooling.
+      // Both the start and the finish of each check are printed: the `config`
+      // leg alone runs 70-90s, so waiting for completion to say anything would
+      // reproduce the silence this is meant to fix, just on a shorter clock.
+      onProgress: progress === "none" ? undefined : (e) => {
+        const secs = e.ms === undefined ? "" : `${(e.ms / 1000).toFixed(1)}s`;
+        const status = e.status === "start" ? "..." : e.status === "ok" ? "ok" : e.status.toUpperCase();
+        const detail = e.detail ? `  ${e.detail}` : "";
+        process.stderr.write(
+          `${e.target.padEnd(9)}${e.stage.padEnd(18)}${status.padEnd(8)}${secs.padStart(6)}${detail}\n`,
+        );
+      },
     });
     if (opts.json) {
       process.stdout.write(JSON.stringify(report, null, 2) + "\n");
     } else {
       process.stdout.write(renderOverview(report) + "\n");
     }
-    if (hasDrift(report)) process.exit(1);
+    // Errors outrank drift. A run with a check that could not complete has an
+    // incomplete drift picture, so reporting exit 1 ("drift, otherwise fine")
+    // would overstate what was actually verified — a TIMEOUT cell alongside
+    // unrelated drift used to exit 1 and read as a clean check (#39).
     if (hasErrors(report)) process.exit(2);
+    if (hasDrift(report)) process.exit(1);
     process.exit(0);
   });
 
