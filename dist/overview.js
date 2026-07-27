@@ -5,19 +5,75 @@ import { join, resolve } from "node:path";
 import { createDirectusClient } from "./http.js";
 import { run } from "./runner.js";
 import { diffExtensions, loadTargets } from "./extensions.js";
-function exec(cmd, args, cwd) {
+// Per-check deadline. Applies to every leg of a target check — git, HTTP
+// reconcilers, and drift probes alike. 0 disables. See #39: before this, one
+// wedged leg blocked the whole command with no output and no upper bound.
+//
+// 5 minutes, not 1: the `config` leg legitimately takes ~70s per target
+// (measured against staging + prod), while every other leg finishes inside 4s.
+// A tighter ceiling would turn a normal slow day into a spurious TIMEOUT. The
+// fine-grained bound lives one level down, in the HTTP client's per-request
+// timeout and retry-elapsed ceiling — this is only the backstop.
+export const OVERVIEW_TIMEOUT_MS = 300_000;
+function isTimeout(e) {
+    return Boolean(e) && e.timeout === true;
+}
+function timeoutErr(label, ms) {
+    const e = new Error(`${label} timed out after ${ms}ms`);
+    e.timeout = true;
+    return e;
+}
+// Races `work` against a deadline. The underlying work is NOT cancelled (it is
+// a reconciler mid-flight); the CLI process.exit()s and the MCP path lets it
+// settle unobserved. What matters is that the caller stops waiting.
+async function withDeadline(label, ms, work) {
+    if (ms <= 0)
+        return work;
+    let timer;
+    try {
+        return await Promise.race([
+            work,
+            new Promise((_, rej) => {
+                timer = setTimeout(() => rej(timeoutErr(label, ms)), ms);
+                timer.unref?.();
+            }),
+        ]);
+    }
+    finally {
+        if (timer)
+            clearTimeout(timer);
+    }
+}
+function exec(cmd, args, cwd, timeoutMs = 0) {
     return new Promise((res, rej) => {
         const child = spawn(cmd, args, { cwd });
         let stdout = "";
         let stderr = "";
+        let timer;
+        if (timeoutMs > 0) {
+            timer = setTimeout(() => {
+                // Real cancellation — a probe or `git fetch` that never returns must
+                // not outlive the command that spawned it.
+                child.kill("SIGKILL");
+                rej(timeoutErr(`${cmd} ${args[0] ?? ""}`.trim(), timeoutMs));
+            }, timeoutMs);
+            timer.unref?.();
+        }
         child.stdout.on("data", (d) => (stdout += d.toString()));
         child.stderr.on("data", (d) => (stderr += d.toString()));
-        child.on("error", (e) => rej(e));
-        child.on("close", (code) => res({ code: code ?? -1, stdout, stderr }));
+        child.on("error", (e) => { if (timer)
+            clearTimeout(timer); rej(e); });
+        child.on("close", (code) => {
+            if (timer)
+                clearTimeout(timer);
+            res({ code: code ?? -1, stdout, stderr });
+        });
     });
 }
-async function git(repoRoot, args) {
-    const r = await exec("git", ["-C", repoRoot, ...args]);
+// git is bounded too: `fetch`/`rev-parse` against an unreachable remote hangs
+// on TCP timeout, which is a hang the caller cannot distinguish from work.
+async function git(repoRoot, args, timeoutMs = OVERVIEW_TIMEOUT_MS) {
+    const r = await exec("git", ["-C", repoRoot, ...args], undefined, timeoutMs);
     if (r.code !== 0) {
         throw new Error(`git ${args[0]} failed: ${r.stderr.trim() || r.stdout.trim()}`);
     }
@@ -187,6 +243,33 @@ const LAYOUT = {
     extensionsDir: "extensions",
 };
 async function checkTarget(input) {
+    // Every leg reports start/finish and is bounded by the same deadline. A leg
+    // that trips it becomes a TIMEOUT cell (an error, so exit 2) instead of
+    // stalling the run.
+    const track = async (stage, run, describe) => {
+        input.onProgress?.({ target: input.name, stage, status: "start" });
+        const t0 = Date.now();
+        try {
+            const v = await withDeadline(`${input.name} ${stage}`, input.timeoutMs, run());
+            const detail = describe(v);
+            const err = v?.error;
+            input.onProgress?.({
+                target: input.name, stage,
+                status: err ? "error" : "ok",
+                ms: Date.now() - t0, detail: err ?? detail,
+            });
+            return v;
+        }
+        catch (e) {
+            const message = e.message;
+            input.onProgress?.({
+                target: input.name, stage,
+                status: isTimeout(e) ? "timeout" : "error",
+                ms: Date.now() - t0, detail: message,
+            });
+            return { error: isTimeout(e) ? `TIMEOUT ${message}` : message };
+        }
+    };
     const out = {
         target: input.name,
         ref: input.ref,
@@ -198,7 +281,7 @@ async function checkTarget(input) {
     };
     // Extensions need no token — always attempted. Compares deployed source
     // tree hash against the target's ref (worktree targets compare vs HEAD).
-    const extPromise = (async () => {
+    const extPromise = track("extensions", async () => {
         try {
             const report = await diffExtensions({
                 targetsFile: input.targetsFile,
@@ -227,9 +310,11 @@ async function checkTarget(input) {
             return summary;
         }
         catch (e) {
+            if (isTimeout(e))
+                throw e; // render TIMEOUT, not a generic error
             return { error: e.message };
         }
-    })();
+    }, (v) => isErr(v) ? undefined : `${v.match} match, ${v.drift} drift, ${v.missing} missing`);
     const token = process.env[input.tokenEnv];
     if (!token) {
         const error = `${input.tokenEnv} not set`;
@@ -241,7 +326,7 @@ async function checkTarget(input) {
     }
     const client = createDirectusClient({ baseUrl: input.baseUrl, token });
     const p = (rel) => join(input.layoutRoot, rel);
-    const migPromise = (async () => {
+    const migPromise = track("migrations", async () => {
         try {
             const { reconcileMigrations } = await import("./reconcilers/migrations.js");
             const results = await reconcileMigrations({
@@ -271,10 +356,12 @@ async function checkTarget(input) {
             return s;
         }
         catch (e) {
+            if (isTimeout(e))
+                throw e; // render TIMEOUT, not a generic error
             return { error: e.message };
         }
-    })();
-    const cfgPromise = (async () => {
+    }, (v) => isErr(v) ? undefined : `${v.applied} applied, ${v.pending} pending, ${v.mutated} mutated`);
+    const cfgPromise = track("config", async () => {
         try {
             const report = await run({
                 target: input.name,
@@ -303,10 +390,14 @@ async function checkTarget(input) {
             return { config, seeds };
         }
         catch (e) {
+            if (isTimeout(e))
+                throw e; // render TIMEOUT, not a generic error
             const error = e.message;
             return { config: { error }, seeds: { error } };
         }
-    })();
+    }, (v) => "config" in v && !isErr(v.config) && !isErr(v.seeds)
+        ? `${v.config.changes} config, ${v.seeds.changes} seed changes`
+        : undefined);
     // Custom drift probes (#38): repo-declared commands, run from the WORKING
     // TREE (repoRoot) — probes compare the env against the repo's current
     // committed state, and the probe script itself may not exist at older refs.
@@ -319,33 +410,44 @@ async function checkTarget(input) {
                 .replaceAll("{url}", input.baseUrl)
                 .replaceAll("{token_env}", input.tokenEnv)
                 .replaceAll("{target}", input.name);
-            try {
-                const r = await exec("sh", ["-c", cmd], input.repoRoot);
-                const lastLine = r.stdout.trim().split("\n").pop() ?? "";
-                let parsed;
+            // Tracked individually — probes are repo-supplied commands and are the
+            // most likely thing to be slow, so "which probe" is the useful signal.
+            const tracked = await track(`probe:${p.name}`, async () => {
                 try {
-                    parsed = JSON.parse(lastLine);
+                    const r = await exec("sh", ["-c", cmd], input.repoRoot, input.timeoutMs);
+                    const lastLine = r.stdout.trim().split("\n").pop() ?? "";
+                    let parsed;
+                    try {
+                        parsed = JSON.parse(lastLine);
+                    }
+                    catch {
+                        throw new Error(r.code === 0
+                            ? "probe printed no JSON"
+                            : `exit ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 200)}`);
+                    }
+                    if (parsed.error)
+                        throw new Error(parsed.error);
+                    return { clean: Boolean(parsed.clean), summary: parsed.summary };
                 }
-                catch {
-                    throw new Error(r.code === 0
-                        ? "probe printed no JSON"
-                        : `exit ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 200)}`);
+                catch (e) {
+                    // A deadline is not a probe failure — let it reach track() so the
+                    // cell renders TIMEOUT rather than an ordinary probe error.
+                    if (isTimeout(e))
+                        throw e;
+                    return { error: e.message };
                 }
-                if (parsed.error)
-                    throw new Error(parsed.error);
-                res[p.name] = { clean: Boolean(parsed.clean), summary: parsed.summary };
-            }
-            catch (e) {
-                res[p.name] = { error: e.message };
-            }
+            }, (v) => isErr(v) ? undefined : (v.summary ?? (v.clean ? "clean" : "drift")));
+            res[p.name] = tracked;
         }));
         return res;
     })();
     const [ext, mig, cfg, probes] = await Promise.all([extPromise, migPromise, cfgPromise, probesPromise]);
     out.extensions = ext;
     out.migrations = mig;
-    out.config = cfg.config;
-    out.seeds = cfg.seeds;
+    // config and seeds share one reconcile pass, so a timeout on that pass fails
+    // both cells rather than leaving them at the "not run" placeholder.
+    out.config = "config" in cfg ? cfg.config : cfg;
+    out.seeds = "config" in cfg ? cfg.seeds : cfg;
     out.probes = probes;
     return out;
 }
@@ -380,6 +482,7 @@ export function resolvePromotionPair(probed, all) {
 }
 export async function runOverview(input) {
     const repoRoot = resolve(input.repoRoot);
+    const timeoutMs = input.timeoutMs ?? OVERVIEW_TIMEOUT_MS;
     const cfg = await loadTargets(input.targetsFile);
     const names = input.targets?.length ? input.targets : Object.keys(cfg.targets);
     const missing = names.filter((n) => !cfg.targets[n]);
@@ -401,9 +504,17 @@ export async function runOverview(input) {
         let layoutRoot = repoRoot;
         if (ref) {
             try {
-                layoutRoot = await materialized(ref);
+                input.onProgress?.({ target: name, stage: "materialize", status: "start", detail: ref });
+                const t0 = Date.now();
+                layoutRoot = await withDeadline(`${name} materialize`, timeoutMs, materialized(ref));
+                input.onProgress?.({ target: name, stage: "materialize", status: "ok", ms: Date.now() - t0, detail: ref });
             }
             catch (e) {
+                input.onProgress?.({
+                    target: name, stage: "materialize",
+                    status: isTimeout(e) ? "timeout" : "error",
+                    detail: e.message,
+                });
                 const error = e.message;
                 return {
                     target: name,
@@ -425,6 +536,8 @@ export async function runOverview(input) {
             repoRoot,
             targetsFile: input.targetsFile,
             probes: cfg.drift_probes ?? [],
+            onProgress: input.onProgress,
+            timeoutMs,
         });
     });
     let promotion = null;
@@ -448,10 +561,18 @@ export async function runOverview(input) {
             promotionSkipped = pair.skipped;
             return;
         }
+        input.onProgress?.({ target: "repo", stage: "promotion", status: "start", detail: `${pair.from} → ${pair.to}` });
+        const t0 = Date.now();
         try {
-            promotion = await computePromotionQueue(repoRoot, pair.from, pair.to);
+            promotion = await withDeadline("promotion queue", timeoutMs, computePromotionQueue(repoRoot, pair.from, pair.to));
+            input.onProgress?.({ target: "repo", stage: "promotion", status: "ok", ms: Date.now() - t0 });
         }
         catch (e) {
+            input.onProgress?.({
+                target: "repo", stage: "promotion",
+                status: isTimeout(e) ? "timeout" : "error",
+                ms: Date.now() - t0, detail: e.message,
+            });
             promotionSkipped = pair.fallback
                 ? `${pair.fallback}; fallback ${pair.from} → ${pair.to} failed: ${e.message}`
                 : e.message;

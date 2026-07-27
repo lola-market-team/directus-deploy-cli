@@ -9,6 +9,19 @@ function toErr(url, status, body) {
 // has no way to distinguish this from a real outage.
 const RETRY_STATUSES = new Set([503, 502, 504]);
 const MAX_RETRIES = 6;
+// Defaults chosen so a single logical request can never exceed ~2.5 min:
+// 6 retries × 30s attempts would be 3min of dead air on its own, so the
+// elapsed ceiling — not the retry count — is what actually bounds it.
+export const REQUEST_TIMEOUT_MS = 30_000;
+export const MAX_ELAPSED_MS = 120_000;
+export function isTimeoutError(e) {
+    return Boolean(e) && e.timeout === true;
+}
+function toTimeoutErr(url, ms) {
+    const e = new Error(`timeout after ${ms}ms :: ${url}`);
+    e.timeout = true;
+    return e;
+}
 function backoffMs(attempt) {
     // 500, 1000, 2000, 4000, 8000, 16000 ms — cumulative ~31s
     return 500 * Math.pow(2, attempt);
@@ -19,6 +32,8 @@ async function sleep(ms) {
 export function createDirectusClient(cfg) {
     const base = cfg.baseUrl.replace(/\/+$/, "");
     const fetchImpl = cfg.fetch ?? globalThis.fetch;
+    const timeoutMs = cfg.timeoutMs ?? REQUEST_TIMEOUT_MS;
+    const maxElapsedMs = cfg.maxElapsedMs ?? MAX_ELAPSED_MS;
     const headers = {
         Authorization: `Bearer ${cfg.token}`,
         "Content-Type": "application/json",
@@ -40,9 +55,14 @@ export function createDirectusClient(cfg) {
     }
     async function fetchWithRetry(url, init) {
         let lastErr = undefined;
+        const startedAt = Date.now();
+        const outOfTime = () => maxElapsedMs > 0 && Date.now() - startedAt >= maxElapsedMs;
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
             try {
-                const r = await fetchImpl(url, init);
+                // Abort the attempt rather than waiting on the OS. Without this a
+                // half-open connection parks forever and the caller has no signal.
+                const signal = timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined;
+                const r = await fetchImpl(url, signal ? { ...init, signal } : init);
                 if (!RETRY_STATUSES.has(r.status))
                     return r;
                 if (attempt === MAX_RETRIES)
@@ -52,17 +72,25 @@ export function createDirectusClient(cfg) {
                     await r.text();
                 }
                 catch { /* ignore */ }
+                lastErr = toErr(url, r.status, "under pressure");
             }
             catch (e) {
-                // Network error (ECONNRESET/EAI_AGAIN) — retry the same window.
-                lastErr = e;
+                // Network error (ECONNRESET/EAI_AGAIN) or our own abort — both are
+                // transient, so both retry inside the elapsed ceiling.
+                const isAbort = e instanceof Error && e.name === "TimeoutError";
+                lastErr = isAbort ? toTimeoutErr(url, timeoutMs) : e;
                 if (attempt === MAX_RETRIES)
-                    throw e;
+                    throw lastErr;
             }
+            if (outOfTime())
+                break;
             await sleep(backoffMs(attempt));
+            if (outOfTime())
+                break;
         }
-        // Unreachable — the loop returns or throws.
-        throw lastErr instanceof Error ? lastErr : new Error("fetch retry exhausted");
+        if (lastErr)
+            throw lastErr;
+        throw new Error("fetch retry exhausted");
     }
     return {
         async get(path) {

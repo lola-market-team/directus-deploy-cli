@@ -30,20 +30,85 @@ interface ExecResult {
   stderr: string;
 }
 
-function exec(cmd: string, args: string[], cwd?: string): Promise<ExecResult> {
+// Per-check deadline. Applies to every leg of a target check — git, HTTP
+// reconcilers, and drift probes alike. 0 disables. See #39: before this, one
+// wedged leg blocked the whole command with no output and no upper bound.
+//
+// 5 minutes, not 1: the `config` leg legitimately takes ~70s per target
+// (measured against staging + prod), while every other leg finishes inside 4s.
+// A tighter ceiling would turn a normal slow day into a spurious TIMEOUT. The
+// fine-grained bound lives one level down, in the HTTP client's per-request
+// timeout and retry-elapsed ceiling — this is only the backstop.
+export const OVERVIEW_TIMEOUT_MS = 300_000;
+
+export interface ProgressEvent {
+  target: string;
+  stage: string;                          // "extensions" | "config" | "probe:attributes" | …
+  status: "start" | "ok" | "error" | "timeout";
+  ms?: number;                            // wall time, on terminal statuses
+  detail?: string;                        // one-line summary or error message
+}
+
+export type ProgressSink = (e: ProgressEvent) => void;
+
+function isTimeout(e: unknown): boolean {
+  return Boolean(e) && (e as { timeout?: boolean }).timeout === true;
+}
+
+function timeoutErr(label: string, ms: number): Error & { timeout: true } {
+  const e = new Error(`${label} timed out after ${ms}ms`) as Error & { timeout: true };
+  e.timeout = true;
+  return e;
+}
+
+// Races `work` against a deadline. The underlying work is NOT cancelled (it is
+// a reconciler mid-flight); the CLI process.exit()s and the MCP path lets it
+// settle unobserved. What matters is that the caller stops waiting.
+async function withDeadline<T>(label: string, ms: number, work: Promise<T>): Promise<T> {
+  if (ms <= 0) return work;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, rej) => {
+        timer = setTimeout(() => rej(timeoutErr(label, ms)), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function exec(cmd: string, args: string[], cwd?: string, timeoutMs = 0): Promise<ExecResult> {
   return new Promise((res, rej) => {
     const child = spawn(cmd, args, { cwd });
     let stdout = "";
     let stderr = "";
+    let timer: NodeJS.Timeout | undefined;
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        // Real cancellation — a probe or `git fetch` that never returns must
+        // not outlive the command that spawned it.
+        child.kill("SIGKILL");
+        rej(timeoutErr(`${cmd} ${args[0] ?? ""}`.trim(), timeoutMs));
+      }, timeoutMs);
+      timer.unref?.();
+    }
     child.stdout.on("data", (d) => (stdout += d.toString()));
     child.stderr.on("data", (d) => (stderr += d.toString()));
-    child.on("error", (e) => rej(e));
-    child.on("close", (code) => res({ code: code ?? -1, stdout, stderr }));
+    child.on("error", (e) => { if (timer) clearTimeout(timer); rej(e); });
+    child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      res({ code: code ?? -1, stdout, stderr });
+    });
   });
 }
 
-async function git(repoRoot: string, args: string[]): Promise<string> {
-  const r = await exec("git", ["-C", repoRoot, ...args]);
+// git is bounded too: `fetch`/`rev-parse` against an unreachable remote hangs
+// on TCP timeout, which is a hang the caller cannot distinguish from work.
+async function git(repoRoot: string, args: string[], timeoutMs = OVERVIEW_TIMEOUT_MS): Promise<string> {
+  const r = await exec("git", ["-C", repoRoot, ...args], undefined, timeoutMs);
   if (r.code !== 0) {
     throw new Error(`git ${args[0]} failed: ${r.stderr.trim() || r.stdout.trim()}`);
   }
@@ -326,7 +391,36 @@ async function checkTarget(input: {
   repoRoot: string;
   targetsFile: string;
   probes: Array<{ name: string; cmd: string }>;
+  onProgress?: ProgressSink;
+  timeoutMs: number;
 }): Promise<TargetOverview> {
+  // Every leg reports start/finish and is bounded by the same deadline. A leg
+  // that trips it becomes a TIMEOUT cell (an error, so exit 2) instead of
+  // stalling the run.
+  const track = async <T>(stage: string, run: () => Promise<T>, describe: (v: T) => string | undefined): Promise<T | { error: string }> => {
+    input.onProgress?.({ target: input.name, stage, status: "start" });
+    const t0 = Date.now();
+    try {
+      const v = await withDeadline(`${input.name} ${stage}`, input.timeoutMs, run());
+      const detail = describe(v);
+      const err = (v as { error?: string } | undefined)?.error;
+      input.onProgress?.({
+        target: input.name, stage,
+        status: err ? "error" : "ok",
+        ms: Date.now() - t0, detail: err ?? detail,
+      });
+      return v;
+    } catch (e) {
+      const message = (e as Error).message;
+      input.onProgress?.({
+        target: input.name, stage,
+        status: isTimeout(e) ? "timeout" : "error",
+        ms: Date.now() - t0, detail: message,
+      });
+      return { error: isTimeout(e) ? `TIMEOUT ${message}` : message };
+    }
+  };
+
   const out: TargetOverview = {
     target: input.name,
     ref: input.ref,
@@ -339,7 +433,7 @@ async function checkTarget(input: {
 
   // Extensions need no token — always attempted. Compares deployed source
   // tree hash against the target's ref (worktree targets compare vs HEAD).
-  const extPromise = (async (): Promise<Dimension<ExtensionsSummary>> => {
+  const extPromise = track("extensions", async (): Promise<Dimension<ExtensionsSummary>> => {
     try {
       const report = await diffExtensions({
         targetsFile: input.targetsFile,
@@ -364,9 +458,10 @@ async function checkTarget(input: {
       }
       return summary;
     } catch (e) {
+      if (isTimeout(e)) throw e; // render TIMEOUT, not a generic error
       return { error: (e as Error).message };
     }
-  })();
+  }, (v) => isErr(v) ? undefined : `${v.match} match, ${v.drift} drift, ${v.missing} missing`);
 
   const token = process.env[input.tokenEnv];
   if (!token) {
@@ -380,7 +475,7 @@ async function checkTarget(input: {
   const client = createDirectusClient({ baseUrl: input.baseUrl, token });
   const p = (rel: string) => join(input.layoutRoot, rel);
 
-  const migPromise = (async (): Promise<Dimension<MigrationsSummary>> => {
+  const migPromise = track("migrations", async (): Promise<Dimension<MigrationsSummary>> => {
     try {
       const { reconcileMigrations } = await import("./reconcilers/migrations.js");
       const results = await reconcileMigrations({
@@ -402,11 +497,12 @@ async function checkTarget(input: {
       }
       return s;
     } catch (e) {
+      if (isTimeout(e)) throw e; // render TIMEOUT, not a generic error
       return { error: (e as Error).message };
     }
-  })();
+  }, (v) => isErr(v) ? undefined : `${v.applied} applied, ${v.pending} pending, ${v.mutated} mutated`);
 
-  const cfgPromise = (async (): Promise<{ config: Dimension<ChangeSummary>; seeds: Dimension<ChangeSummary> }> => {
+  const cfgPromise = track("config", async (): Promise<{ config: Dimension<ChangeSummary>; seeds: Dimension<ChangeSummary> }> => {
     try {
       const report = await run({
         target: input.name,
@@ -433,10 +529,13 @@ async function checkTarget(input: {
       }
       return { config, seeds };
     } catch (e) {
+      if (isTimeout(e)) throw e; // render TIMEOUT, not a generic error
       const error = (e as Error).message;
       return { config: { error }, seeds: { error } };
     }
-  })();
+  }, (v) => "config" in v && !isErr(v.config) && !isErr(v.seeds)
+    ? `${v.config.changes} config, ${v.seeds.changes} seed changes`
+    : undefined);
 
   // Custom drift probes (#38): repo-declared commands, run from the WORKING
   // TREE (repoRoot) — probes compare the env against the repo's current
@@ -451,8 +550,11 @@ async function checkTarget(input: {
           .replaceAll("{url}", input.baseUrl)
           .replaceAll("{token_env}", input.tokenEnv)
           .replaceAll("{target}", input.name);
+        // Tracked individually — probes are repo-supplied commands and are the
+        // most likely thing to be slow, so "which probe" is the useful signal.
+        const tracked = await track(`probe:${p.name}`, async (): Promise<Dimension<ProbeSummary>> => {
         try {
-          const r = await exec("sh", ["-c", cmd], input.repoRoot);
+          const r = await exec("sh", ["-c", cmd], input.repoRoot, input.timeoutMs);
           const lastLine = r.stdout.trim().split("\n").pop() ?? "";
           let parsed: ProbeSummary & { error?: string };
           try {
@@ -465,10 +567,15 @@ async function checkTarget(input: {
             );
           }
           if (parsed.error) throw new Error(parsed.error);
-          res[p.name] = { clean: Boolean(parsed.clean), summary: parsed.summary };
+          return { clean: Boolean(parsed.clean), summary: parsed.summary };
         } catch (e) {
-          res[p.name] = { error: (e as Error).message };
+          // A deadline is not a probe failure — let it reach track() so the
+          // cell renders TIMEOUT rather than an ordinary probe error.
+          if (isTimeout(e)) throw e;
+          return { error: (e as Error).message };
         }
+        }, (v) => isErr(v) ? undefined : (v.summary ?? (v.clean ? "clean" : "drift")));
+        res[p.name] = tracked;
       }),
     );
     return res;
@@ -477,8 +584,10 @@ async function checkTarget(input: {
   const [ext, mig, cfg, probes] = await Promise.all([extPromise, migPromise, cfgPromise, probesPromise]);
   out.extensions = ext;
   out.migrations = mig;
-  out.config = cfg.config;
-  out.seeds = cfg.seeds;
+  // config and seeds share one reconcile pass, so a timeout on that pass fails
+  // both cells rather than leaving them at the "not run" placeholder.
+  out.config = "config" in cfg ? cfg.config : cfg;
+  out.seeds = "config" in cfg ? cfg.seeds : cfg;
   out.probes = probes;
   return out;
 }
@@ -491,6 +600,8 @@ export interface OverviewInput {
   targets?: string[];  // restrict to these targets
   from?: string;       // promotion queue source ref (default: inferred)
   to?: string;         // promotion queue destination ref (default: inferred)
+  onProgress?: ProgressSink; // per-check lifecycle events (#39)
+  timeoutMs?: number;  // per-check deadline; 0 disables. Default OVERVIEW_TIMEOUT_MS.
 }
 
 // Infer the promotion pair from the targets' refs: exactly two distinct refs,
@@ -529,6 +640,7 @@ export function resolvePromotionPair(
 
 export async function runOverview(input: OverviewInput): Promise<OverviewReport> {
   const repoRoot = resolve(input.repoRoot);
+  const timeoutMs = input.timeoutMs ?? OVERVIEW_TIMEOUT_MS;
   const cfg = await loadTargets(input.targetsFile);
   const names = input.targets?.length ? input.targets : Object.keys(cfg.targets);
   const missing = names.filter((n) => !cfg.targets[n]);
@@ -551,8 +663,16 @@ export async function runOverview(input: OverviewInput): Promise<OverviewReport>
     let layoutRoot = repoRoot;
     if (ref) {
       try {
-        layoutRoot = await materialized(ref);
+        input.onProgress?.({ target: name, stage: "materialize", status: "start", detail: ref });
+        const t0 = Date.now();
+        layoutRoot = await withDeadline(`${name} materialize`, timeoutMs, materialized(ref));
+        input.onProgress?.({ target: name, stage: "materialize", status: "ok", ms: Date.now() - t0, detail: ref });
       } catch (e) {
+        input.onProgress?.({
+          target: name, stage: "materialize",
+          status: isTimeout(e) ? "timeout" : "error",
+          detail: (e as Error).message,
+        });
         const error = (e as Error).message;
         return {
           target: name,
@@ -574,6 +694,8 @@ export async function runOverview(input: OverviewInput): Promise<OverviewReport>
       repoRoot,
       targetsFile: input.targetsFile,
       probes: cfg.drift_probes ?? [],
+      onProgress: input.onProgress,
+      timeoutMs,
     });
   });
 
@@ -596,9 +718,17 @@ export async function runOverview(input: OverviewInput): Promise<OverviewReport>
       promotionSkipped = pair.skipped;
       return;
     }
+    input.onProgress?.({ target: "repo", stage: "promotion", status: "start", detail: `${pair.from} → ${pair.to}` });
+    const t0 = Date.now();
     try {
-      promotion = await computePromotionQueue(repoRoot, pair.from, pair.to);
+      promotion = await withDeadline("promotion queue", timeoutMs, computePromotionQueue(repoRoot, pair.from, pair.to));
+      input.onProgress?.({ target: "repo", stage: "promotion", status: "ok", ms: Date.now() - t0 });
     } catch (e) {
+      input.onProgress?.({
+        target: "repo", stage: "promotion",
+        status: isTimeout(e) ? "timeout" : "error",
+        ms: Date.now() - t0, detail: (e as Error).message,
+      });
       promotionSkipped = pair.fallback
         ? `${pair.fallback}; fallback ${pair.from} → ${pair.to} failed: ${(e as Error).message}`
         : (e as Error).message;

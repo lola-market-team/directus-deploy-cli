@@ -48,7 +48,23 @@ Each target declares its branch in the targets file (`"ref": "origin/develop"`);
 
 Below the matrix, the promotion block is a release preview: the queued commit list (merge subjects carry PR numbers), and per queued extension the expected artifact commit joined with what the destination currently runs (`prod runs 5cb20e99 → would get 59ce4ffc`) plus the commits in between — the same view a release PR body would show. The join reuses the `/_meta` sourceCommit already fetched for the extensions row, so it costs no extra network.
 
-Exit codes: `0` in sync, `1` drift, `2` a check could not run. `--json` emits the full report (untruncated detail lists) for dashboards or Slack bots.
+Exit codes: `2` a check could not run, `1` drift, `0` in sync — errors outrank drift, because a run with an incomplete check has an incomplete drift picture. `--json` emits the full report (untruncated detail lists) for dashboards or Slack bots.
+
+### Progress and deadlines
+
+Checks announce themselves on **stderr** as they finish, one line each, so a long run is legible while it runs and stdout stays clean for `--json` and for piping:
+
+```
+$ directus-deploy overview --targets staging,prod
+staging  migrations        ok        0.5s  88 applied, 0 pending, 0 mutated
+prod     extensions        ok        0.8s  23 match, 0 drift, 0 missing
+staging  probe:attributes  ok        1.6s  in sync
+prod     config            TIMEOUT  30.0s  prod config timed out after 30000ms
+```
+
+`--progress auto|plain|none` controls it (`auto` = `plain`, including when stdout is not a TTY — the CI/agent case; `none` restores silent operation for anything parsing stderr).
+
+`--timeout <ms>` (default `300000`, `0` disables) bounds every check — git, HTTP reconcilers, and drift probes alike. A check that trips it renders as `TIMEOUT` in the matrix and sets exit 2 rather than stalling the command; a timed-out probe is killed, not abandoned. The default is deliberately generous because the `config` leg legitimately runs 70–90s per target while every other leg finishes inside 4s. The tighter bound lives in the HTTP client, which times out each request after 30s and caps a whole retry sequence at 120s — without that ceiling, a target that 503-flaps costs six retries of exponential backoff per request, which is what made `overview` look deadlocked with no output at all.
 
 ### Custom drift probes
 
