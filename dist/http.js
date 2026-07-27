@@ -17,8 +17,8 @@ export const MAX_ELAPSED_MS = 120_000;
 export function isTimeoutError(e) {
     return Boolean(e) && e.timeout === true;
 }
-function toTimeoutErr(url, ms) {
-    const e = new Error(`timeout after ${ms}ms :: ${url}`);
+function toTimeoutErr(url, ms, method = "GET") {
+    const e = new Error(`timeout after ${ms}ms :: ${method} ${url}`);
     e.timeout = true;
     return e;
 }
@@ -57,6 +57,12 @@ export function createDirectusClient(cfg) {
         let lastErr = undefined;
         const startedAt = Date.now();
         const outOfTime = () => maxElapsedMs > 0 && Date.now() - startedAt >= maxElapsedMs;
+        // A timeout is an abort on OUR side: the request may well have reached the
+        // server and committed. Replaying that is only safe when the method is
+        // idempotent, so a timed-out write surfaces immediately instead of
+        // retrying and risking a duplicate row.
+        const method = (init?.method ?? "GET").toUpperCase();
+        const replayableOnTimeout = method === "GET" || method === "HEAD";
         for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
             try {
                 // Abort the attempt rather than waiting on the OS. Without this a
@@ -67,18 +73,23 @@ export function createDirectusClient(cfg) {
                     return r;
                 if (attempt === MAX_RETRIES)
                     return r;
-                // Drain body so the connection is reusable.
+                // Drain body so the connection is reusable — and keep it, so an
+                // exhausted retry sequence reports what the server actually said.
+                let body = "";
                 try {
-                    await r.text();
+                    body = await r.text();
                 }
                 catch { /* ignore */ }
-                lastErr = toErr(url, r.status, "under pressure");
+                lastErr = toErr(url, r.status, body || "under pressure");
             }
             catch (e) {
-                // Network error (ECONNRESET/EAI_AGAIN) or our own abort — both are
-                // transient, so both retry inside the elapsed ceiling.
+                // A 503 means the server shed the request without processing it, so
+                // retrying any method is safe (handled above). Here we are dealing
+                // with our own abort, or a network error.
                 const isAbort = e instanceof Error && e.name === "TimeoutError";
-                lastErr = isAbort ? toTimeoutErr(url, timeoutMs) : e;
+                lastErr = isAbort ? toTimeoutErr(url, timeoutMs, method) : e;
+                if (isAbort && !replayableOnTimeout)
+                    throw lastErr;
                 if (attempt === MAX_RETRIES)
                     throw lastErr;
             }

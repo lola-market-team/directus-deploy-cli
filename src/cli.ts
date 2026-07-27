@@ -666,7 +666,7 @@ program
   .option("--json", "emit JSON report instead of the matrix")
   .option(
     "--progress <mode>",
-    "per-check progress on stderr: auto (plain when stdout is not a TTY) | plain | none",
+    "per-check progress on stderr: auto (currently identical to plain) | plain | none",
     "auto",
   )
   .option(
@@ -709,10 +709,12 @@ program
       to: opts.to,
       timeoutMs,
       // stderr keeps stdout clean for --json and for piping into other tooling.
+      // Both the start and the finish of each check are printed: the `config`
+      // leg alone runs 70-90s, so waiting for completion to say anything would
+      // reproduce the silence this is meant to fix, just on a shorter clock.
       onProgress: progress === "none" ? undefined : (e) => {
-        if (e.status === "start") return; // one line per completed check
         const secs = e.ms === undefined ? "" : `${(e.ms / 1000).toFixed(1)}s`;
-        const status = e.status === "ok" ? "ok" : e.status.toUpperCase();
+        const status = e.status === "start" ? "..." : e.status === "ok" ? "ok" : e.status.toUpperCase();
         const detail = e.detail ? `  ${e.detail}` : "";
         process.stderr.write(
           `${e.target.padEnd(9)}${e.stage.padEnd(18)}${status.padEnd(8)}${secs.padStart(6)}${detail}\n`,

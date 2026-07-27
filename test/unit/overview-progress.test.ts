@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { execSync } from "node:child_process";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,8 +53,12 @@ describe("overview progress + per-check deadline (#39)", () => {
   }, 30_000);
 
   it("times out a wedged probe, kills it, and reports it as an error (exit 2)", async () => {
-    // Would outlive the command by minutes without a kill.
-    const { repoRoot, targetsFile } = await repoWithProbe("sleep 120");
+    // A COMPOUND command on purpose. `sh -c "sleep 120"` is exec-replaced by
+    // sh, so killing the child pid happens to reach the worker — which made an
+    // earlier version of this test pass against a kill that could not handle
+    // the realistic shapes (`a | b`, `cd x && a`), where the worker is a
+    // grandchild in the same process group. See the orphan check below.
+    const { repoRoot, targetsFile } = await repoWithProbe("cd / && sleep 120 | cat");
     process.env.DIRECTUS_SANDBOX_TOKEN = "tok";
 
     const events: ProgressEvent[] = [];
@@ -77,10 +82,20 @@ describe("overview progress + per-check deadline (#39)", () => {
     expect(hasErrors(report)).toBe(true);
     // Bounded by the deadline, not by the 120s sleep.
     expect(elapsed).toBeLessThan(30_000);
+
+    // The whole process group must be gone, not just the `sh` that spawned it.
+    // An orphaned probe keeps holding its connection to the target.
+    await new Promise((r) => setTimeout(r, 500));
+    // `sleep 1[2]0` still matches the probe's "sleep 120", but the bracket
+    // keeps the pgrep command line itself from matching — otherwise the shell
+    // execSync spawns shows up as its own false positive.
+    const orphans = execSync(`pgrep -f "sleep 1[2]0" || true`, { encoding: "utf8" }).trim();
+    expect(orphans).toBe("");
   }, 60_000);
 
   it("runs without a progress sink (the MCP path) and still applies the deadline", async () => {
-    const { repoRoot, targetsFile } = await repoWithProbe("sleep 120");
+    // Distinct duration so it can't collide with the orphan pgrep above.
+    const { repoRoot, targetsFile } = await repoWithProbe("sleep 121");
     process.env.DIRECTUS_SANDBOX_TOKEN = "tok";
 
     const report = await runOverview({ targetsFile, repoRoot, timeoutMs: 300 });

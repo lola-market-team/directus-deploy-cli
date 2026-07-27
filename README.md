@@ -52,19 +52,28 @@ Exit codes: `2` a check could not run, `1` drift, `0` in sync — errors outrank
 
 ### Progress and deadlines
 
-Checks announce themselves on **stderr** as they finish, one line each, so a long run is legible while it runs and stdout stays clean for `--json` and for piping:
+Checks announce themselves on **stderr** — once when they start, once when they finish — so a long run is legible while it runs and stdout stays clean for `--json` and for piping:
 
 ```
 $ directus-deploy overview --targets staging,prod
-staging  migrations        ok        0.5s  88 applied, 0 pending, 0 mutated
-prod     extensions        ok        0.8s  23 match, 0 drift, 0 missing
-staging  probe:attributes  ok        1.6s  in sync
+staging  materialize       ...             origin/develop
+staging  config            ...
+staging  probe:attributes  ...
+staging  migrations        ok        0.9s  88 applied, 0 pending, 0 mutated
+staging  probe:attributes  ok        2.3s  in sync
+staging  config            ok       86.0s  0 config, 0 seed changes
 prod     config            TIMEOUT  30.0s  prod config timed out after 30000ms
 ```
 
-`--progress auto|plain|none` controls it (`auto` = `plain`, including when stdout is not a TTY — the CI/agent case; `none` restores silent operation for anything parsing stderr).
+Both edges are printed on purpose: the `config` leg alone runs 70–90s, so waiting for completion before saying anything would reproduce the silence this is meant to fix, just on a shorter clock.
 
-`--timeout <ms>` (default `300000`, `0` disables) bounds every check — git, HTTP reconcilers, and drift probes alike. A check that trips it renders as `TIMEOUT` in the matrix and sets exit 2 rather than stalling the command; a timed-out probe is killed, not abandoned. The default is deliberately generous because the `config` leg legitimately runs 70–90s per target while every other leg finishes inside 4s. The tighter bound lives in the HTTP client, which times out each request after 30s and caps a whole retry sequence at 120s — without that ceiling, a target that 503-flaps costs six retries of exponential backoff per request, which is what made `overview` look deadlocked with no output at all.
+`--progress auto|plain|none` controls it (`auto` = `plain`; `none` restores silent operation for anything parsing stderr).
+
+`--timeout <ms>` (default `300000`, `0` disables) bounds every check — git, HTTP reconcilers, and drift probes alike. A check that trips it renders as `TIMEOUT` in the matrix and sets exit 2 rather than stalling the command. A timed-out probe is killed by **process group**, not by pid: probes run as `sh -c "<cmd>"`, and `sh` only exec-replaces itself for a single command, so `a | b` or `cd x && a` would otherwise leave the real worker orphaned and still holding its connection to the target.
+
+The default is deliberately generous because the `config` leg legitimately runs 70–90s per target while every other leg finishes inside 4s. The tighter bound lives in the HTTP client, which times out each request after 30s and caps a whole retry sequence at 120s — without that ceiling, a target that 503-flaps costs six retries of exponential backoff per request, which is what made `overview` look deadlocked with no output at all.
+
+**Timeouts never replay a write.** A 503 means the server shed the request without processing it, so any method is safe to retry. A timeout is an abort on the client side — the request may have reached the server and committed — so it is replayed only for `GET`/`HEAD`. A timed-out `POST`/`PATCH`/`DELETE` surfaces immediately rather than risking a duplicate row.
 
 ### Custom drift probes
 

@@ -46,15 +46,29 @@ async function withDeadline(label, ms, work) {
 }
 function exec(cmd, args, cwd, timeoutMs = 0) {
     return new Promise((res, rej) => {
-        const child = spawn(cmd, args, { cwd });
+        // `detached` puts the child in its own process group so the deadline can
+        // kill the whole tree. Killing the child pid alone is not enough: probes
+        // run as `sh -c "<cmd>"`, and sh only exec-replaces itself for a SINGLE
+        // command — `a | b` or `cd x && a` leaves the real worker as a grandchild
+        // that survives the kill and keeps holding its connection to the target.
+        const child = spawn(cmd, args, { cwd, detached: timeoutMs > 0 });
         let stdout = "";
         let stderr = "";
         let timer;
         if (timeoutMs > 0) {
             timer = setTimeout(() => {
-                // Real cancellation — a probe or `git fetch` that never returns must
-                // not outlive the command that spawned it.
-                child.kill("SIGKILL");
+                try {
+                    // Negative pid = the whole process group.
+                    if (child.pid)
+                        process.kill(-child.pid, "SIGKILL");
+                }
+                catch {
+                    // Group already gone (ESRCH) — fall back to the direct child.
+                    try {
+                        child.kill("SIGKILL");
+                    }
+                    catch { /* already dead */ }
+                }
                 rej(timeoutErr(`${cmd} ${args[0] ?? ""}`.trim(), timeoutMs));
             }, timeoutMs);
             timer.unref?.();
@@ -133,8 +147,11 @@ export function classifyPromotionPaths(entries) {
         seeds: seeds.sort(),
     };
 }
-export async function computePromotionQueue(repoRoot, from, to) {
-    const ahead = Number((await git(repoRoot, ["rev-list", "--count", `${to}..${from}`])).trim());
+export async function computePromotionQueue(repoRoot, from, to, timeoutMs = OVERVIEW_TIMEOUT_MS) {
+    // Bound every git invocation to the caller's deadline, so `--timeout 0`
+    // genuinely disables rather than silently leaving git on its own default.
+    const g = (args) => git(repoRoot, args, timeoutMs);
+    const ahead = Number((await g(["rev-list", "--count", `${to}..${from}`])).trim());
     // Behind answers "does `to` hold CONTENT that `from` lacks" — the thing the
     // next release would clobber. Raw SHA counting inflates it with (a) the
     // merge commit every release PR mints on `to`, one per release forever, and
@@ -143,7 +160,7 @@ export async function computePromotionQueue(repoRoot, from, to) {
     // --no-merges drops merge commits (they have no patch-id and would always
     // count). What's left is genuinely missing from `from` — a back-port that
     // needed even one line of conflict resolution still counts, correctly.
-    const behind = Number((await git(repoRoot, [
+    const behind = Number((await g([
         "rev-list",
         "--count",
         "--right-only",
@@ -151,7 +168,7 @@ export async function computePromotionQueue(repoRoot, from, to) {
         "--no-merges",
         `${from}...${to}`,
     ])).trim());
-    const raw = await git(repoRoot, [
+    const raw = await g([
         "diff",
         "--name-status",
         "--no-renames",
@@ -171,7 +188,7 @@ export async function computePromotionQueue(repoRoot, from, to) {
         return { status: status.charAt(0), path: rest.join("\t") };
     });
     const classified = classifyPromotionPaths(entries);
-    const commits = parseCommitLog(await git(repoRoot, ["log", "--format=%h%x09%s", "-n", String(COMMIT_LIST_CAP), `${to}..${from}`]));
+    const commits = parseCommitLog(await g(["log", "--format=%h%x09%s", "-n", String(COMMIT_LIST_CAP), `${to}..${from}`]));
     const extensionDetails = [];
     for (const name of classified.extensions) {
         // Same pathspec as resolveArtifactSourceCommit — the bucket filename /
@@ -184,14 +201,14 @@ export async function computePromotionQueue(repoRoot, from, to) {
         ];
         let expected = null;
         try {
-            expected = (await git(repoRoot, ["log", "-1", "--format=%h", from, ...pathspec])).trim() || null;
+            expected = (await g(["log", "-1", "--format=%h", from, ...pathspec])).trim() || null;
         }
         catch {
             // ref vanished mid-run or pathspec quirk — detail row still renders
         }
         let extCommits = [];
         try {
-            extCommits = parseCommitLog(await git(repoRoot, ["log", "--format=%h%x09%s", "-n", String(COMMIT_LIST_CAP), `${to}..${from}`, ...pathspec]));
+            extCommits = parseCommitLog(await g(["log", "--format=%h%x09%s", "-n", String(COMMIT_LIST_CAP), `${to}..${from}`, ...pathspec]));
         }
         catch {
             // same — leave the commit list empty rather than dropping the row
@@ -213,11 +230,13 @@ export async function computePromotionQueue(repoRoot, from, to) {
 // Extract the deployable dirs at a ref into a temp dir so the file-reading
 // reconcilers see the branch's state instead of the working tree. `extensions`
 // is included because the migrations reconciler scans extensions/*/migrations.
-async function materializeRef(repoRoot, ref) {
+async function materializeRef(repoRoot, ref, timeoutMs = OVERVIEW_TIMEOUT_MS) {
     const dir = await mkdtemp(join(tmpdir(), "dd-overview-"));
     const quote = (s) => `'${s.replace(/'/g, "'\\''")}'`;
+    // A pipeline, so sh cannot exec-replace itself — without a deadline here the
+    // git and tar processes outlive an abandoned check entirely.
     const cmd = `git -C ${quote(repoRoot)} archive ${quote(ref)} directus_config migrations extensions | tar -xf - -C ${quote(dir)}`;
-    const r = await exec("sh", ["-c", cmd]);
+    const r = await exec("sh", ["-c", cmd], undefined, timeoutMs);
     if (r.code !== 0) {
         await rm(dir, { recursive: true, force: true });
         throw new Error(`could not materialize ${ref}: ${r.stderr.trim() || r.stdout.trim()} (is the ref fetched?)`);
@@ -436,7 +455,7 @@ async function checkTarget(input) {
                         throw e;
                     return { error: e.message };
                 }
-            }, (v) => isErr(v) ? undefined : (v.summary ?? (v.clean ? "clean" : "drift")));
+            }, (v) => (isErr(v) ? undefined : (v.summary ?? (v.clean ? "clean" : "drift"))));
             res[p.name] = tracked;
         }));
         return res;
@@ -493,7 +512,7 @@ export async function runOverview(input) {
     const materialized = (ref) => {
         let p = matCache.get(ref);
         if (!p) {
-            p = materializeRef(repoRoot, ref);
+            p = materializeRef(repoRoot, ref, timeoutMs);
             matCache.set(ref, p);
         }
         return p;
@@ -564,7 +583,7 @@ export async function runOverview(input) {
         input.onProgress?.({ target: "repo", stage: "promotion", status: "start", detail: `${pair.from} → ${pair.to}` });
         const t0 = Date.now();
         try {
-            promotion = await withDeadline("promotion queue", timeoutMs, computePromotionQueue(repoRoot, pair.from, pair.to));
+            promotion = await withDeadline("promotion queue", timeoutMs, computePromotionQueue(repoRoot, pair.from, pair.to, timeoutMs));
             input.onProgress?.({ target: "repo", stage: "promotion", status: "ok", ms: Date.now() - t0 });
         }
         catch (e) {

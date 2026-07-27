@@ -70,6 +70,75 @@ describe("createDirectusClient per-attempt timeout", () => {
   });
 });
 
+describe("createDirectusClient does not replay non-idempotent writes on timeout", () => {
+  // The dangerous case: the server DOES commit, just slower than our deadline.
+  // Aborting and retrying would create the row twice.
+  function slowCommitFetch(dispatched: string[]): typeof globalThis.fetch {
+    return async (_url, init) => {
+      dispatched.push((init?.method ?? "GET").toUpperCase());
+      await new Promise<void>((res, rej) => {
+        const t = setTimeout(res, 300);
+        init?.signal?.addEventListener("abort", () => {
+          clearTimeout(t);
+          const e = new Error("aborted");
+          e.name = "TimeoutError";
+          rej(e);
+        });
+      });
+      return jsonResponse({ data: { id: 1 } });
+    };
+  }
+
+  for (const method of ["post", "patch", "delete"] as const) {
+    it(`${method} dispatches exactly once and surfaces the timeout`, async () => {
+      const dispatched: string[] = [];
+      const client = createDirectusClient({
+        baseUrl: "https://example.invalid",
+        token: "t",
+        fetch: slowCommitFetch(dispatched),
+        timeoutMs: 50,
+        maxElapsedMs: 5_000,
+      });
+
+      const err = await (method === "delete"
+        ? client.delete("/items/x")
+        : client[method]("/items/x", { a: 1 })
+      ).catch((e) => e);
+
+      expect(isTimeoutError(err)).toBe(true);
+      expect(dispatched).toHaveLength(1);
+    });
+  }
+
+  it("still replays a timed-out GET, which is safe to repeat", async () => {
+    const dispatched: string[] = [];
+    const client = createDirectusClient({
+      baseUrl: "https://example.invalid",
+      token: "t",
+      fetch: slowCommitFetch(dispatched),
+      timeoutMs: 50,
+      maxElapsedMs: 1_200,
+    });
+    await client.get("/items/x").catch(() => undefined);
+    expect(dispatched.length).toBeGreaterThan(1);
+  });
+
+  it("still retries a write on 503 — the server shed it without processing", async () => {
+    let calls = 0;
+    const client = createDirectusClient({
+      baseUrl: "https://example.invalid",
+      token: "t",
+      fetch: async () => {
+        calls++;
+        if (calls === 1) return new Response("under pressure", { status: 503 });
+        return jsonResponse({ data: { ok: true } });
+      },
+    });
+    await expect(client.post("/items/x", {})).resolves.toEqual({ ok: true });
+    expect(calls).toBe(2);
+  });
+});
+
 describe("createDirectusClient retry-elapsed ceiling", () => {
   it("stops retrying 503s once maxElapsedMs is spent instead of running the full backoff", async () => {
     let calls = 0;
