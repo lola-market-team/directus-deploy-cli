@@ -169,6 +169,49 @@ function cleanTarget(name: string, ref: string): TargetOverview {
   };
 }
 
+describe("extensions cell: unverifiable is not clean", () => {
+  // Same defect class as the seeds cell, one row above it: the check only
+  // tested drift === 0, so extensions whose deployed commit could not be
+  // verified at all (no _meta, or a SHA not in local git -- squash-orphaned,
+  // or a `dev` placeholder from a build whose stamp step never ran) rendered
+  // as "✓ 20/23 match". Three extensions ran unverifiable code on a shared
+  // environment while the matrix showed green.
+  const promotion = {
+    from: "origin/develop", to: "origin/master",
+    commitsAhead: 0, commitsBehind: 0, commits: [], commitsTruncated: false,
+    migrations: { added: [], modified: [], removed: [] },
+    extensions: [], extensionDetails: [], schema: [], seeds: [],
+  };
+  function target(match: number, drift: number, missing: number): TargetOverview {
+    const t = cleanTarget("test", "origin/develop");
+    t.extensions = { match, drift, missing, driftList: [], missingList: [], sourceCommits: {} };
+    return t;
+  }
+
+  it("does not claim a match when some are unverifiable", () => {
+    const out = renderOverview({ targets: [target(20, 0, 3)], promotion });
+    expect(out).toMatch(/\? 3 unverified/);
+    expect(out).not.toMatch(/✓ 20\/23 match/);
+  });
+
+  it("still renders ✓ when everything verified", () => {
+    const out = renderOverview({ targets: [target(23, 0, 0)], promotion });
+    expect(out).toMatch(/✓ 23\/23 match/);
+  });
+
+  it("real drift still wins over unverifiable", () => {
+    const out = renderOverview({ targets: [target(20, 2, 1)], promotion });
+    expect(out).toMatch(/✗ 2 behind/);
+  });
+
+  // Unverifiable is a "?", not a "✗": nothing is known to be wrong, so it must
+  // not fail CI -- same contract as unmanaged seed rows.
+  it("unverifiable alone is not drift", () => {
+    const report = { targets: [target(20, 0, 3)], promotion };
+    expect(hasDrift(report)).toBe(false);
+  });
+});
+
 describe("unmanaged seed rows (meta.delete disabled)", () => {
   // Regression guard. A collection with meta.delete unset produced a `skipped`
   // result, overview counted only created/updated/extra, and the cell rendered
