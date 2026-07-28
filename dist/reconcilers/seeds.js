@@ -260,11 +260,16 @@ export async function reconcileSeeds(input) {
         if (extras.length === 0)
             continue;
         if (!c.deleteEnabled) {
+            // meta.delete is off, so prune will never touch these. Report the count
+            // structurally as well as in prose: `skipped` alone made this invisible
+            // to overview, which meant a collection could diverge indefinitely and
+            // still render "in sync".
             results.push({
                 kind: "seeds",
                 label: `seeds/${c.collection}`,
                 action: "skipped",
                 reason: `${extras.length} server row(s) not in seed (meta.delete not enabled)`,
+                unmanaged: extras.length,
             });
             continue;
         }

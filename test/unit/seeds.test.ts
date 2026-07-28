@@ -244,8 +244,41 @@ describe("server extras + prune (#36)", () => {
       label: "seeds/messaging_templates",
       action: "skipped",
       reason: "1 server row(s) not in seed (meta.delete not enabled)",
+      unmanaged: 1,
     });
     expect(client.delete).not.toHaveBeenCalled();
+  });
+
+  // The count has to be machine-readable, not only inside the prose reason:
+  // overview only looked at created/updated/extra, so a skipped-with-a-number
+  // result rendered as "✓ in sync" and a collection could diverge for months
+  // unnoticed. This is the regression guard for that.
+  it("meta.delete unset → carries a structured unmanaged count, not just prose", async () => {
+    const seedDir = await writeSeedDir(seedBody({ preserve_ids: true }));
+    const client = mockClient({
+      fieldsByCollection: { messaging_templates: idPk },
+      itemsByCollection: {
+        messaging_templates: [
+          { id: 1, subject: "keep" },
+          { id: 2, subject: "stale" },
+          { id: 3, subject: "also stale" },
+        ],
+      },
+    });
+    const results = await reconcileSeeds({ seedDir, client, opts: { dryRun: true } });
+    const skipped = results.find((r) => r.action === "skipped" && r.label === "seeds/messaging_templates");
+    expect(skipped?.unmanaged).toBe(2);
+    // and it must NOT masquerade as actionable drift
+    expect(results.some((r) => r.action === "extra")).toBe(false);
+    expect(client.delete).not.toHaveBeenCalled();
+  });
+
+  it("meta.delete=true → no unmanaged count (the rows are actionable instead)", async () => {
+    const seedDir = await writeSeedDir(seedBody({ preserve_ids: true, delete: true }));
+    const client = mockClient({ fieldsByCollection: { messaging_templates: idPk }, itemsByCollection: { messaging_templates: serverRows } });
+    const results = await reconcileSeeds({ seedDir, client, opts: { dryRun: true } });
+    expect(results.every((r) => r.unmanaged === undefined)).toBe(true);
+    expect(results.some((r) => r.action === "extra")).toBe(true);
   });
 
   it("meta.delete=true without --prune → per-row 'extra', nothing deleted", async () => {

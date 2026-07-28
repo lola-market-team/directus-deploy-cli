@@ -169,6 +169,76 @@ function cleanTarget(name: string, ref: string): TargetOverview {
   };
 }
 
+describe("unmanaged seed rows (meta.delete disabled)", () => {
+  // Regression guard. A collection with meta.delete unset produced a `skipped`
+  // result, overview counted only created/updated/extra, and the cell rendered
+  // "✓ in sync" over a real divergence. Three separate retirements reached git
+  // without reaching the servers before anyone noticed -- 23 stale rows on
+  // prod across rental_messages and rental_states.
+  function targetWithUnmanaged(name: string, ref: string): TargetOverview {
+    const t = cleanTarget(name, ref);
+    t.seeds = {
+      changes: 0,
+      changeList: [],
+      unmanaged: 23,
+      unmanagedList: [
+        "? seeds/rental_messages — 20 server row(s) not in seed (meta.delete not enabled)",
+        "? seeds/rental_states — 3 server row(s) not in seed (meta.delete not enabled)",
+      ],
+    };
+    return t;
+  }
+  const promotion = {
+    from: "origin/develop",
+    to: "origin/master",
+    commitsAhead: 0,
+    commitsBehind: 0,
+    commits: [],
+    commitsTruncated: false,
+    migrations: { added: [], modified: [], removed: [] },
+    extensions: [],
+    extensionDetails: [],
+    schema: [],
+    seeds: [],
+  };
+
+  it("does NOT render the seeds cell as in sync", () => {
+    const out = renderOverview({ targets: [targetWithUnmanaged("prod", "origin/master")], promotion });
+    expect(out).toMatch(/23 unmanaged/);
+    // the specific bug: this string must not appear for the seeds row
+    expect(out).not.toMatch(/seeds\s+✓ in sync/);
+  });
+
+  it("names the diverging collections in the detail block", () => {
+    const out = renderOverview({ targets: [targetWithUnmanaged("prod", "origin/master")], promotion });
+    expect(out).toMatch(/rental_messages — 20 server row\(s\) not in seed/);
+    expect(out).toMatch(/rental_states — 3 server row\(s\) not in seed/);
+  });
+
+  it("replaces the 'All environments in sync' closing line", () => {
+    const out = renderOverview({ targets: [targetWithUnmanaged("prod", "origin/master")], promotion });
+    expect(out).not.toMatch(/All environments in sync/);
+    expect(out).toMatch(/No actionable drift\. 23 unmanaged row\(s\) diverge/);
+  });
+
+  // Exit-code contract: unmanaged rows are NOT actionable -- no command will
+  // change them -- so they must not fail CI or flip `diff`/`verify`.
+  it("does not count as drift or error", () => {
+    const report = { targets: [targetWithUnmanaged("prod", "origin/master")], promotion };
+    expect(hasDrift(report)).toBe(false);
+    expect(hasErrors(report)).toBe(false);
+  });
+
+  it("real drift still wins the cell", () => {
+    const t = targetWithUnmanaged("prod", "origin/master");
+    t.seeds = { ...t.seeds, changes: 2, changeList: ["+ seeds/x[1]", "+ seeds/x[2]"] };
+    const out = renderOverview({ targets: [t], promotion });
+    expect(out).toMatch(/✗ 2 changes/);
+    expect(out).toMatch(/Drift detected/);
+    expect(hasDrift({ targets: [t], promotion })).toBe(true);
+  });
+});
+
 describe("renderOverview / hasDrift / hasErrors", () => {
   it("renders an all-green matrix with the promotion column", () => {
     const report: OverviewReport = {
