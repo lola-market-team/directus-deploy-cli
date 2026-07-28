@@ -643,7 +643,19 @@ export async function promoteExtension(input) {
 }
 async function listExtensions(repoRoot) {
     const { readdir } = await import("node:fs/promises");
-    const entries = await readdir(join(repoRoot, "extensions"));
+    // A sparse checkout, or a --repo-root pointed one level off, has no
+    // extensions/ at all. That's the same stale-environment class this listing
+    // exists to survive, so it must not throw the whole dimension away: git can
+    // still supply the inventory from the ref.
+    let entries;
+    try {
+        entries = await readdir(join(repoRoot, "extensions"));
+    }
+    catch (e) {
+        if (e.code === "ENOENT")
+            return [];
+        throw e;
+    }
     const out = [];
     for (const e of entries) {
         // Filter to entries that look like extensions (have a package.json).
@@ -666,15 +678,28 @@ async function listExtensions(repoRoot) {
 // on what "the code" means. Returns null when the ref can't be resolved —
 // worktree targets pass HEAD, and a detached or unborn HEAD is not an error
 // worth failing the run over.
+// Selects on `<name>/package.json` rather than listing directories, for two
+// reasons. It applies the same "looks like an extension" test as the on-disk
+// listing — without it, any tracked directory under extensions/ (docs, shared
+// fixtures, a dir left behind by a rename) becomes a name we probe, 404s on,
+// and report as unverified forever. A permanent `? 2 unverified` is not a
+// louder warning than `✓ 24/24`; it is a warning nobody reads, which spends
+// the signal #42 just bought.
+//
+// And `-z` because --name-only otherwise honours core.quotePath: a non-ASCII
+// extension name comes back as `"sp\303\244ter"`, quotes and octal included,
+// which would be probed literally.
 async function listExtensionsAtRef(repoRoot, ref) {
-    const r = await runCommand("git", ["-C", repoRoot, "ls-tree", "-d", "--name-only", `${ref}:extensions`]);
+    const r = await runCommand("git", ["-C", repoRoot, "ls-tree", "-r", "-z", "--name-only", `${ref}:extensions`]);
     if (r.code !== 0)
         return null;
-    return r.stdout
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean)
-        .sort();
+    const out = new Set();
+    for (const path of r.stdout.split("\0")) {
+        const m = /^([^/]+)\/package\.json$/.exec(path);
+        if (m)
+            out.add(m[1]);
+    }
+    return [...out].sort();
 }
 // Union of what `ref` carries and what is on disk. Neither side alone is
 // sufficient: the ref misses an extension added locally but not yet pushed,

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execSync } from "node:child_process";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { diffExtensions, renderDiff } from "../../src/extensions.js";
@@ -309,12 +309,45 @@ describe("diffExtensions inventory is taken from the reference, not the working 
     expect(row.cells["test"]!.error).toBeUndefined();
   });
 
-  it("still lists an extension that exists on disk but not in the reference", async () => {
+  // The union's other half. An earlier version of this test asserted `chat`
+  // against reference `main` — but `chat` IS in `main`, so it passed with the
+  // on-disk listing deleted outright. It has to be a name git cannot supply:
+  // committed nowhere, present only on disk.
+  it("still lists an extension that exists on disk but in no ref at all", async () => {
     const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    await mkdir(join(repoRoot, "extensions/localwip/src"), { recursive: true });
+    await writeFile(join(repoRoot, "extensions/localwip/package.json"), "{}", "utf8");
     vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
-    // `main` has chat only; the union must not lose the on-disk entry.
-    const report = await diffExtensions({ targetsFile, repoRoot, reference: "main" });
-    expect(report.rows.map((r) => r.extension)).toContain("chat");
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "newer" });
+    expect(report.rows.map((r) => r.extension)).toContain("localwip");
+  });
+
+  // Without the package.json filter every tracked directory under
+  // extensions/ becomes a probed name that 404s and reports as unverified
+  // forever — trading a false ✓ for a permanent ? nobody reads.
+  it("excludes a tracked directory at the ref that isn't an extension", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    const git = (cmd: string) => execSync(`git ${cmd}`, { cwd: repoRoot, encoding: "utf8" }).trim();
+    git("checkout -q newer");
+    await mkdir(join(repoRoot, "extensions/docs"), { recursive: true });
+    await writeFile(join(repoRoot, "extensions/docs/README.md"), "notes\n", "utf8");
+    git("add extensions"); // not `add .` — targets.json must stay untracked
+
+    git("-c user.email=t@t -c user.name=t commit -q -m docs");
+    git("checkout -q main");
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "newer" });
+    expect(report.rows.map((r) => r.extension)).not.toContain("docs");
+  });
+
+  // Sparse checkout, or --repo-root pointed one level off. readdir throws
+  // ENOENT; git can still supply the whole inventory from the ref.
+  it("survives a checkout with no extensions/ directory on disk", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    await rm(join(repoRoot, "extensions"), { recursive: true, force: true });
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "newer" });
+    expect(report.rows.map((r) => r.extension).sort()).toEqual(["chat", "sql-runner"]);
   });
 
   it("falls back to the working tree when the reference cannot be resolved", async () => {

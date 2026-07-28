@@ -11,6 +11,7 @@ import {
   renderOverview,
   hasDrift,
   hasErrors,
+  bucketExtensionCell,
 } from "../../src/overview.js";
 import type { OverviewReport, TargetOverview } from "../../src/overview.js";
 
@@ -432,5 +433,28 @@ describe("drift probes (#38)", () => {
     expect(text).toContain("⚠ test attributes: probe printed no JSON");
     expect(hasDrift(report)).toBe(false);
     expect(hasErrors(report)).toBe(true);
+  });
+});
+
+describe("bucketExtensionCell: nothing-to-compare is unverified, not drift", () => {
+  const TREE = "a".repeat(40);
+
+  it("counts a resolved commit whose src is absent at that commit as unverified", () => {
+    // Reachable once the inventory is taken from the reference (#43): a name
+    // the ref carries, deployed, but with no extensions/<name>/src at the
+    // deployed commit. Pre-#43 this printed `✗ 1 behind` with no hint.
+    expect(bucketExtensionCell({ deployedTreeHash: null, matchesReference: false })).toBe("unverified");
+  });
+
+  it("counts an error cell as unverified", () => {
+    expect(bucketExtensionCell({ error: "HTTP 404", deployedTreeHash: null, matchesReference: false })).toBe("unverified");
+  });
+
+  it("still calls a genuine content difference drift", () => {
+    expect(bucketExtensionCell({ deployedTreeHash: TREE, matchesReference: false })).toBe("drift");
+  });
+
+  it("still calls a matching tree hash a match", () => {
+    expect(bucketExtensionCell({ deployedTreeHash: TREE, matchesReference: true })).toBe("match");
   });
 });
