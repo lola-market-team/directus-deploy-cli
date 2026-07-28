@@ -23,7 +23,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && chmod +x dist/cli.js dist/mcp-server.js",
     "dev": "tsx src/cli.ts",
     "test": "vitest run",
     "test:live": "vitest run --config vitest.live.config.ts",
