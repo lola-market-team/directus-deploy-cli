@@ -352,6 +352,12 @@ export interface ExtensionsSummary {
 export interface ChangeSummary {
   changes: number;
   changeList: string[];
+  // Divergence nothing will act on: server rows absent from the seed in a
+  // collection with meta.delete disabled. Counted apart from `changes` so a
+  // green matrix keeps meaning "no pending work", while the divergence still
+  // gets said out loud instead of vanishing into a SKIPPED line.
+  unmanaged?: number;
+  unmanagedList?: string[];
 }
 
 export type Dimension<T> = T | { error: string };
@@ -535,11 +541,15 @@ async function checkTarget(input: {
         opts: { dryRun: true },
         entities: new Set<EntityKind>([...CONFIG_ENTITIES, "seeds"]),
       });
-      const config: ChangeSummary = { changes: 0, changeList: [] };
-      const seeds: ChangeSummary = { changes: 0, changeList: [] };
+      const config: ChangeSummary = { changes: 0, changeList: [], unmanaged: 0, unmanagedList: [] };
+      const seeds: ChangeSummary = { changes: 0, changeList: [], unmanaged: 0, unmanagedList: [] };
       for (const r of report.results) {
-        if (r.action !== "created" && r.action !== "updated" && r.action !== "extra") continue;
         const bucket = r.kind === "seeds" ? seeds : config;
+        if (r.unmanaged) {
+          bucket.unmanaged = (bucket.unmanaged ?? 0) + r.unmanaged;
+          bucket.unmanagedList!.push(`? ${r.label} — ${r.reason ?? `${r.unmanaged} row(s) not in seed`}`);
+        }
+        if (r.action !== "created" && r.action !== "updated" && r.action !== "extra") continue;
         bucket.changes++;
         bucket.changeList.push(`${r.action === "created" ? "+" : r.action === "extra" ? "!" : "~"} ${r.label}`);
       }
@@ -550,7 +560,8 @@ async function checkTarget(input: {
       return { config: { error }, seeds: { error } };
     }
   }, (v) => "config" in v && !isErr(v.config) && !isErr(v.seeds)
-    ? `${v.config.changes} config, ${v.seeds.changes} seed changes`
+    ? `${v.config.changes} config, ${v.seeds.changes} seed changes` +
+      (v.seeds.unmanaged ? `, ${v.seeds.unmanaged} unmanaged` : "")
     : undefined);
 
   // Custom drift probes (#38): repo-declared commands, run from the WORKING
@@ -804,7 +815,12 @@ function cellExtensions(d: Dimension<ExtensionsSummary>): string {
 
 function cellChanges(d: Dimension<ChangeSummary>): string {
   if (isErr(d)) return "⚠ unreachable";
-  return d.changes === 0 ? "✓ in sync" : `✗ ${d.changes} change${d.changes === 1 ? "" : "s"}`;
+  if (d.changes > 0) return `✗ ${d.changes} change${d.changes === 1 ? "" : "s"}`;
+  // No pending work, but the target still holds rows the seed does not. Say so
+  // rather than claiming parity: "✓ in sync" over a real divergence is how a
+  // collection stays diverged for months without anyone noticing.
+  if (d.unmanaged) return `? ${d.unmanaged} unmanaged`;
+  return "✓ in sync";
 }
 
 export function renderOverview(report: OverviewReport): string {
@@ -883,7 +899,10 @@ export function renderOverview(report: OverviewReport): string {
     if (isErr(t.config)) details.push(`⚠ ${t.target} config: ${t.config.error}`);
     else for (const c of truncate(t.config.changeList)) details.push(`✗ ${t.target} config ${c}`);
     if (isErr(t.seeds)) details.push(`⚠ ${t.target} seeds: ${t.seeds.error}`);
-    else for (const c of truncate(t.seeds.changeList)) details.push(`✗ ${t.target} seeds ${c}`);
+    else {
+      for (const c of truncate(t.seeds.changeList)) details.push(`✗ ${t.target} seeds ${c}`);
+      for (const c of truncate(t.seeds.unmanagedList ?? [])) details.push(`${t.target} seeds ${c}`);
+    }
     for (const [name, d] of Object.entries(t.probes ?? {})) {
       if (isErr(d)) details.push(`⚠ ${t.target} ${name}: ${d.error}`);
       else if (!d.clean) details.push(`✗ ${t.target} ${name}: ${d.summary ?? "drift"}`);
@@ -935,13 +954,23 @@ export function renderOverview(report: OverviewReport): string {
 
   const anyDrift = hasDrift(report);
   const anyErr = hasErrors(report);
+  // Unmanaged rows are deliberately NOT drift: no command acts on them, so
+  // they must not flip the exit code. They do have to change the closing
+  // sentence though -- "All environments in sync" over a known divergence is
+  // the exact wording that let 23 stale rows sit on prod unnoticed.
+  const unmanaged = report.targets.reduce(
+    (n, t) => n + (isErr(t.seeds) ? 0 : (t.seeds.unmanaged ?? 0)),
+    0,
+  );
   lines.push("");
   lines.push(
     anyDrift
       ? "  Drift detected."
       : anyErr
         ? "  No drift found, but some checks could not run."
-        : "  All environments in sync.",
+        : unmanaged > 0
+          ? `  No actionable drift. ${unmanaged} unmanaged row(s) diverge — enable meta.delete to prune, or pull them into the seed.`
+          : "  All environments in sync.",
   );
   return lines.join("\n");
 }
