@@ -652,6 +652,43 @@ async function listExtensions(repoRoot) {
     }
     return out.sort();
 }
+// Extension names present in `ref`, read from git rather than the working
+// tree. A checkout that is behind origin simply does not have the newer
+// extension's directory on disk, so a working-tree listing drops it from the
+// diff entirely — no row, no error, absent from BOTH numerator and
+// denominator, and the matrix prints a clean `N/N` over an inventory that
+// silently shrank. Observed 2026-07-28: a 10-commit-stale checkout rendered
+// `23/23 match` on test and staging while both were running a 24th extension
+// (sql-runner) that neither count mentioned.
+//
+// `ref` is the same reference the tree hashes are compared against
+// (origin/develop, typically), so the inventory and the comparison now agree
+// on what "the code" means. Returns null when the ref can't be resolved —
+// worktree targets pass HEAD, and a detached or unborn HEAD is not an error
+// worth failing the run over.
+async function listExtensionsAtRef(repoRoot, ref) {
+    const r = await runCommand("git", ["-C", repoRoot, "ls-tree", "-d", "--name-only", `${ref}:extensions`]);
+    if (r.code !== 0)
+        return null;
+    return r.stdout
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .sort();
+}
+// Union of what `ref` carries and what is on disk. Neither side alone is
+// sufficient: the ref misses an extension added locally but not yet pushed,
+// and the working tree misses one added upstream but not yet pulled. A name
+// from either source that the other lacks still gets a row — where it
+// resolves to no tree hash, the existing machinery reports it as an error
+// cell rather than as drift.
+async function listExtensionsForDiff(repoRoot, ref) {
+    const onDisk = await listExtensions(repoRoot);
+    const atRef = await listExtensionsAtRef(repoRoot, ref);
+    if (!atRef)
+        return onDisk;
+    return [...new Set([...onDisk, ...atRef])].sort();
+}
 export async function statusExtensions(input) {
     const cfg = await loadTargets(input.targetsFile);
     const target = cfg.targets[input.target];
@@ -734,7 +771,7 @@ export async function diffExtensions(input) {
     }
     const names = input.extensions?.length
         ? input.extensions
-        : await listExtensions(input.repoRoot);
+        : await listExtensionsForDiff(input.repoRoot, input.reference);
     // Tree-hash cache — one lookup per (sha, ext) pair, reused across targets.
     // Compare `extensions/<ext>/src` (not the full folder): README, CHANGELOG,
     // and other non-code changes shouldn't flag content drift because they

@@ -244,3 +244,83 @@ describe("scratch repo shape (integration scaffold)", () => {
     expect(root).toBeTruthy();
   });
 });
+
+describe("diffExtensions inventory is taken from the reference, not the working tree", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // A checkout that is behind origin: `newer` carries a second extension, the
+  // working tree does not. Mirrors 2026-07-28, when a 10-commit-stale clone
+  // rendered `23/23 match` on two targets that were each running a 24th
+  // extension the counts never mentioned.
+  async function staleCheckout(): Promise<{ repoRoot: string; targetsFile: string; newerSha: string }> {
+    const repoRoot = await mkdtemp(join(tmpdir(), "diff-stale-"));
+    const git = (cmd: string) => execSync(`git ${cmd}`, { cwd: repoRoot, encoding: "utf8" }).trim();
+    await mkdir(join(repoRoot, "extensions/chat/src"), { recursive: true });
+    await writeFile(join(repoRoot, "extensions/chat/package.json"), "{}", "utf8");
+    await writeFile(join(repoRoot, "extensions/chat/src/index.ts"), "export {}\n", "utf8");
+    git("init -q -b main");
+    git("add .");
+    git("-c user.email=t@t -c user.name=t commit -q -m chat");
+
+    git("checkout -q -b newer");
+    await mkdir(join(repoRoot, "extensions/sql-runner/src"), { recursive: true });
+    await writeFile(join(repoRoot, "extensions/sql-runner/package.json"), "{}", "utf8");
+    await writeFile(join(repoRoot, "extensions/sql-runner/src/index.ts"), "export {}\n", "utf8");
+    git("add .");
+    git("-c user.email=t@t -c user.name=t commit -q -m sql-runner");
+    const newerSha = git("rev-parse --short HEAD");
+
+    // Back to a branch without it — the directory leaves the working tree.
+    git("checkout -q main");
+
+    const targetsFile = join(repoRoot, "targets.json");
+    await writeFile(
+      targetsFile,
+      JSON.stringify({
+        targets: {
+          test: {
+            base_url: "http://localhost:1",
+            ssh_host: "unused",
+            ssh_user: "unused",
+            remote_extensions_path: "/unused",
+          },
+        },
+      }),
+      "utf8",
+    );
+    return { repoRoot, targetsFile, newerSha };
+  }
+
+  it("includes an extension present in the reference but absent from the working tree", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "newer" });
+    expect(report.rows.map((r) => r.extension).sort()).toEqual(["chat", "sql-runner"]);
+  });
+
+  it("verifies that extension rather than silently dropping it from both counts", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "newer" });
+    const row = report.rows.find((r) => r.extension === "sql-runner")!;
+    expect(row.cells["test"]!.matchesReference).toBe(true);
+    expect(row.cells["test"]!.error).toBeUndefined();
+  });
+
+  it("still lists an extension that exists on disk but not in the reference", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    // `main` has chat only; the union must not lose the on-disk entry.
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "main" });
+    expect(report.rows.map((r) => r.extension)).toContain("chat");
+  });
+
+  it("falls back to the working tree when the reference cannot be resolved", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "origin/does-not-exist" });
+    expect(report.rows.map((r) => r.extension)).toEqual(["chat"]);
+  });
+});
