@@ -643,7 +643,19 @@ export async function promoteExtension(input) {
 }
 async function listExtensions(repoRoot) {
     const { readdir } = await import("node:fs/promises");
-    const entries = await readdir(join(repoRoot, "extensions"));
+    // A sparse checkout, or a --repo-root pointed one level off, has no
+    // extensions/ at all. That's the same stale-environment class this listing
+    // exists to survive, so it must not throw the whole dimension away: git can
+    // still supply the inventory from the ref.
+    let entries;
+    try {
+        entries = await readdir(join(repoRoot, "extensions"));
+    }
+    catch (e) {
+        if (e.code === "ENOENT")
+            return [];
+        throw e;
+    }
     const out = [];
     for (const e of entries) {
         // Filter to entries that look like extensions (have a package.json).
@@ -651,6 +663,56 @@ async function listExtensions(repoRoot) {
             out.push(e);
     }
     return out.sort();
+}
+// Extension names present in `ref`, read from git rather than the working
+// tree. A checkout that is behind origin simply does not have the newer
+// extension's directory on disk, so a working-tree listing drops it from the
+// diff entirely — no row, no error, absent from BOTH numerator and
+// denominator, and the matrix prints a clean `N/N` over an inventory that
+// silently shrank. Observed 2026-07-28: a 10-commit-stale checkout rendered
+// `23/23 match` on test and staging while both were running a 24th extension
+// (sql-runner) that neither count mentioned.
+//
+// `ref` is the same reference the tree hashes are compared against
+// (origin/develop, typically), so the inventory and the comparison now agree
+// on what "the code" means. Returns null when the ref can't be resolved —
+// worktree targets pass HEAD, and a detached or unborn HEAD is not an error
+// worth failing the run over.
+// Selects on `<name>/package.json` rather than listing directories, for two
+// reasons. It applies the same "looks like an extension" test as the on-disk
+// listing — without it, any tracked directory under extensions/ (docs, shared
+// fixtures, a dir left behind by a rename) becomes a name we probe, 404s on,
+// and report as unverified forever. A permanent `? 2 unverified` is not a
+// louder warning than `✓ 24/24`; it is a warning nobody reads, which spends
+// the signal #42 just bought.
+//
+// And `-z` because --name-only otherwise honours core.quotePath: a non-ASCII
+// extension name comes back as `"sp\303\244ter"`, quotes and octal included,
+// which would be probed literally.
+async function listExtensionsAtRef(repoRoot, ref) {
+    const r = await runCommand("git", ["-C", repoRoot, "ls-tree", "-r", "-z", "--name-only", `${ref}:extensions`]);
+    if (r.code !== 0)
+        return null;
+    const out = new Set();
+    for (const path of r.stdout.split("\0")) {
+        const m = /^([^/]+)\/package\.json$/.exec(path);
+        if (m)
+            out.add(m[1]);
+    }
+    return [...out].sort();
+}
+// Union of what `ref` carries and what is on disk. Neither side alone is
+// sufficient: the ref misses an extension added locally but not yet pushed,
+// and the working tree misses one added upstream but not yet pulled. A name
+// from either source that the other lacks still gets a row — where it
+// resolves to no tree hash, the existing machinery reports it as an error
+// cell rather than as drift.
+async function listExtensionsForDiff(repoRoot, ref) {
+    const onDisk = await listExtensions(repoRoot);
+    const atRef = await listExtensionsAtRef(repoRoot, ref);
+    if (!atRef)
+        return onDisk;
+    return [...new Set([...onDisk, ...atRef])].sort();
 }
 export async function statusExtensions(input) {
     const cfg = await loadTargets(input.targetsFile);
@@ -734,7 +796,7 @@ export async function diffExtensions(input) {
     }
     const names = input.extensions?.length
         ? input.extensions
-        : await listExtensions(input.repoRoot);
+        : await listExtensionsForDiff(input.repoRoot, input.reference);
     // Tree-hash cache — one lookup per (sha, ext) pair, reused across targets.
     // Compare `extensions/<ext>/src` (not the full folder): README, CHANGELOG,
     // and other non-code changes shouldn't flag content drift because they

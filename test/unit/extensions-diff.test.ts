@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { execSync } from "node:child_process";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { diffExtensions, renderDiff } from "../../src/extensions.js";
@@ -242,5 +242,118 @@ describe("scratch repo shape (integration scaffold)", () => {
     // Not calling diffExtensions here (it needs fetch + git); the CLI harness
     // exercises that flow. This test just anchors the fixture shape.
     expect(root).toBeTruthy();
+  });
+});
+
+describe("diffExtensions inventory is taken from the reference, not the working tree", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  // A checkout that is behind origin: `newer` carries a second extension, the
+  // working tree does not. Mirrors 2026-07-28, when a 10-commit-stale clone
+  // rendered `23/23 match` on two targets that were each running a 24th
+  // extension the counts never mentioned.
+  async function staleCheckout(): Promise<{ repoRoot: string; targetsFile: string; newerSha: string }> {
+    const repoRoot = await mkdtemp(join(tmpdir(), "diff-stale-"));
+    const git = (cmd: string) => execSync(`git ${cmd}`, { cwd: repoRoot, encoding: "utf8" }).trim();
+    await mkdir(join(repoRoot, "extensions/chat/src"), { recursive: true });
+    await writeFile(join(repoRoot, "extensions/chat/package.json"), "{}", "utf8");
+    await writeFile(join(repoRoot, "extensions/chat/src/index.ts"), "export {}\n", "utf8");
+    git("init -q -b main");
+    git("add .");
+    git("-c user.email=t@t -c user.name=t commit -q -m chat");
+
+    git("checkout -q -b newer");
+    await mkdir(join(repoRoot, "extensions/sql-runner/src"), { recursive: true });
+    await writeFile(join(repoRoot, "extensions/sql-runner/package.json"), "{}", "utf8");
+    await writeFile(join(repoRoot, "extensions/sql-runner/src/index.ts"), "export {}\n", "utf8");
+    git("add .");
+    git("-c user.email=t@t -c user.name=t commit -q -m sql-runner");
+    const newerSha = git("rev-parse --short HEAD");
+
+    // Back to a branch without it — the directory leaves the working tree.
+    git("checkout -q main");
+
+    const targetsFile = join(repoRoot, "targets.json");
+    await writeFile(
+      targetsFile,
+      JSON.stringify({
+        targets: {
+          test: {
+            base_url: "http://localhost:1",
+            ssh_host: "unused",
+            ssh_user: "unused",
+            remote_extensions_path: "/unused",
+          },
+        },
+      }),
+      "utf8",
+    );
+    return { repoRoot, targetsFile, newerSha };
+  }
+
+  it("includes an extension present in the reference but absent from the working tree", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "newer" });
+    expect(report.rows.map((r) => r.extension).sort()).toEqual(["chat", "sql-runner"]);
+  });
+
+  it("verifies that extension rather than silently dropping it from both counts", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "newer" });
+    const row = report.rows.find((r) => r.extension === "sql-runner")!;
+    expect(row.cells["test"]!.matchesReference).toBe(true);
+    expect(row.cells["test"]!.error).toBeUndefined();
+  });
+
+  // The union's other half. An earlier version of this test asserted `chat`
+  // against reference `main` — but `chat` IS in `main`, so it passed with the
+  // on-disk listing deleted outright. It has to be a name git cannot supply:
+  // committed nowhere, present only on disk.
+  it("still lists an extension that exists on disk but in no ref at all", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    await mkdir(join(repoRoot, "extensions/localwip/src"), { recursive: true });
+    await writeFile(join(repoRoot, "extensions/localwip/package.json"), "{}", "utf8");
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "newer" });
+    expect(report.rows.map((r) => r.extension)).toContain("localwip");
+  });
+
+  // Without the package.json filter every tracked directory under
+  // extensions/ becomes a probed name that 404s and reports as unverified
+  // forever — trading a false ✓ for a permanent ? nobody reads.
+  it("excludes a tracked directory at the ref that isn't an extension", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    const git = (cmd: string) => execSync(`git ${cmd}`, { cwd: repoRoot, encoding: "utf8" }).trim();
+    git("checkout -q newer");
+    await mkdir(join(repoRoot, "extensions/docs"), { recursive: true });
+    await writeFile(join(repoRoot, "extensions/docs/README.md"), "notes\n", "utf8");
+    git("add extensions"); // not `add .` — targets.json must stay untracked
+
+    git("-c user.email=t@t -c user.name=t commit -q -m docs");
+    git("checkout -q main");
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "newer" });
+    expect(report.rows.map((r) => r.extension)).not.toContain("docs");
+  });
+
+  // Sparse checkout, or --repo-root pointed one level off. readdir throws
+  // ENOENT; git can still supply the whole inventory from the ref.
+  it("survives a checkout with no extensions/ directory on disk", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    await rm(join(repoRoot, "extensions"), { recursive: true, force: true });
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "newer" });
+    expect(report.rows.map((r) => r.extension).sort()).toEqual(["chat", "sql-runner"]);
+  });
+
+  it("falls back to the working tree when the reference cannot be resolved", async () => {
+    const { repoRoot, targetsFile, newerSha } = await staleCheckout();
+    vi.stubGlobal("fetch", async () => ({ ok: true, json: async () => ({ sourceCommit: newerSha }) }));
+    const report = await diffExtensions({ targetsFile, repoRoot, reference: "origin/does-not-exist" });
+    expect(report.rows.map((r) => r.extension)).toEqual(["chat"]);
   });
 });

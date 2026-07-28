@@ -349,6 +349,28 @@ export interface ExtensionsSummary {
   sourceCommits: Record<string, string | null>;
 }
 
+// Which bucket a single extension cell belongs in. Extracted so the
+// classification is testable on its own — it decides whether a target renders
+// green, yellow or red, and it previously had a hole that could only be
+// reached through a live diff.
+//
+// `deployedTreeHash === null` with no error means the deployed commit
+// resolved but `extensions/<name>/src` doesn't exist at it: a renamed or
+// moved source dir, or a name carried only by the reference. Nothing can be
+// compared, so it is unverified, NOT drift. It used to fall through to the
+// drift branch and print `✗ N behind` with a null branchHint — a red cell
+// with no explanation and nothing to act on. renderDiff already showed this
+// same cell as `?`; the two consumers disagreed.
+export function bucketExtensionCell(cell: {
+  error?: string;
+  deployedTreeHash: string | null;
+  matchesReference: boolean;
+}): "match" | "drift" | "unverified" {
+  if (cell.error) return "unverified";
+  if (!cell.deployedTreeHash) return "unverified";
+  return cell.matchesReference ? "match" : "drift";
+}
+
 export interface ChangeSummary {
   changes: number;
   changeList: string[];
@@ -468,10 +490,11 @@ async function checkTarget(input: {
         const cell = row.cells[input.name];
         if (!cell) continue;
         summary.sourceCommits[row.extension] = cell.sourceCommit;
-        if (cell.error) {
+        const bucket = bucketExtensionCell(cell);
+        if (bucket === "unverified") {
           summary.missing++;
           summary.missingList.push(row.extension);
-        } else if (cell.matchesReference) {
+        } else if (bucket === "match") {
           summary.match++;
         } else {
           summary.drift++;
