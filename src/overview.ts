@@ -809,8 +809,15 @@ function cellMigrations(d: Dimension<MigrationsSummary>): string {
 function cellExtensions(d: Dimension<ExtensionsSummary>): string {
   if (isErr(d)) return "⚠ unreachable";
   const total = d.match + d.drift + d.missing;
-  if (d.drift === 0) return `✓ ${d.match}/${total} match`;
-  return `✗ ${d.drift} behind`;
+  if (d.drift > 0) return `✗ ${d.drift} behind`;
+  // drift === 0 is NOT the same as verified. `missing` counts extensions whose
+  // deployed commit could not be checked at all -- no _meta, or a SHA absent
+  // from local git (squash-orphaned, or a `dev` placeholder from a build whose
+  // stamp step never ran). Rendering "✓ 20/23 match" over those claims a
+  // verification that did not happen, which is how three extensions ran
+  // unverifiable code on a shared env while the matrix showed green.
+  if (d.missing > 0) return `? ${d.missing} unverified`;
+  return `✓ ${d.match}/${total} match`;
 }
 
 function cellChanges(d: Dimension<ChangeSummary>): string {
