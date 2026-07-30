@@ -69,13 +69,18 @@ describe("reconcileSeeds match_on (natural-key identity)", () => {
     await reconcileSeeds({ seedDir: dir, client, opts: { dryRun: false } });
     expect(calls.post).toHaveLength(0);
     expect(calls.patch).toHaveLength(1);
-    // PATCHes the row the natural key matched (server id 1), NOT the seed's 999
+    // PATCHes the row the natural key matched (server id 1), NOT the seed's 999,
+    // and never sends the pk — so a drifted server id is adopted, not churned.
     expect(calls.patch[0].path).toBe(`/items/${COLL}/1`);
     expect(calls.patch[0].body.title).toBe("NEW");
-    expect(calls.patch[0].body).not.toHaveProperty("id"); // id is env-local, never asserted
+    expect(calls.patch[0].body).not.toHaveProperty("id");
   });
 
-  it("new natural key → POST without an id", async () => {
+  it("new natural key → POST ASSERTS the seed's id (kept git-authoritative / synced across envs)", async () => {
+    // FK-coherence: a new row must land on the SAME id on every env, because
+    // other seeds embed that id as a FK (attribute_values_id, parent_id, …).
+    // Stripping it here (as 0.28.0 did) would let each env assign its own serial
+    // and dangle those FKs. So the create body MUST carry the id + FK columns.
     writeSeed(
       [{ id: 5, categories_id: 2, languages_code: "de-DE", title: "Neu" }],
       { match_on: NAT },
@@ -84,8 +89,8 @@ describe("reconcileSeeds match_on (natural-key identity)", () => {
     await reconcileSeeds({ seedDir: dir, client, opts: { dryRun: false } });
     expect(calls.patch).toHaveLength(0);
     expect(calls.post).toHaveLength(1);
-    expect(calls.post[0].body).not.toHaveProperty("id");
-    expect(calls.post[0].body).toMatchObject({ categories_id: 2, languages_code: "de-DE" });
+    expect(calls.post[0].body).toHaveProperty("id", 5); // asserted, not stripped
+    expect(calls.post[0].body).toMatchObject({ id: 5, categories_id: 2, languages_code: "de-DE" });
   });
 
   it("extras are computed by natural key and pruned by pk", async () => {
