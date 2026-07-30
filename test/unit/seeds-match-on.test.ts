@@ -8,7 +8,13 @@ import type { DirectusClient } from "../../src/types.js";
 // A recording DirectusClient. GET answers the two paths the reconciler hits
 // (/fields/<c> for PK resolution, /items/<c> for the server rows); writes are
 // captured so a test can assert exactly what the reconciler did.
-function mockClient(server: Record<string, unknown>[], pkField = "id") {
+// `refRows` maps a referencing collection name → rows it returns for the
+// reference-lookup filter query (used by reference-aware prune tests).
+function mockClient(
+  server: Record<string, unknown>[],
+  pkField = "id",
+  refRows: Record<string, Record<string, unknown>[]> = {},
+) {
   const calls = {
     post: [] as { path: string; body: any }[],
     patch: [] as { path: string; body: any }[],
@@ -18,7 +24,11 @@ function mockClient(server: Record<string, unknown>[], pkField = "id") {
     async get(path) {
       if (path.startsWith("/fields/"))
         return [{ field: pkField, schema: { is_primary_key: true } }] as any;
-      if (path.startsWith("/items/")) return server as any;
+      if (path.startsWith("/items/")) {
+        const coll = path.slice("/items/".length).split("?")[0];
+        if (coll !== COLL && refRows[coll]) return refRows[coll] as any; // reference lookup
+        return server as any;
+      }
       return null;
     },
     async post(path, body) { calls.post.push({ path, body }); return {}; },
@@ -133,6 +143,55 @@ describe("reconcileSeeds match_on (natural-key identity)", () => {
     expect(calls.post).toHaveLength(0);
     expect(calls.patch).toHaveLength(0);
     expect(calls.delete).toHaveLength(0);
+  });
+
+  it("reference-aware prune: deletes an unreferenced extra, REFUSES a referenced one", async () => {
+    // Seed knows about the row keyed (1,keep). Server also has two extras:
+    // id 90 (referenced by user data) and id 91 (orphan). Only 91 may be pruned.
+    writeSeed(
+      [{ categories_id: 1, languages_code: "en-US", title: "keep" }],
+      {
+        match_on: NAT,
+        delete: true,
+        referenced_by: [{ table: "listings_x", column: "cat_transl_id" }],
+      },
+    );
+    const server = [
+      { id: 1, categories_id: 1, languages_code: "en-US", title: "keep" }, // in seed
+      { id: 90, categories_id: 9, languages_code: "en-US", title: "referenced extra" },
+      { id: 91, categories_id: 8, languages_code: "en-US", title: "orphan extra" },
+    ];
+    // A user-data row points at extra 90 (but not 91).
+    const { client, calls } = mockClient(server, "id", {
+      listings_x: [{ cat_transl_id: 90 }],
+    });
+    const res = await reconcileSeeds({ seedDir: dir, client, opts: { dryRun: false, prune: true } });
+    // 91 deleted; 90 skipped (referenced), reported, NOT deleted.
+    expect(calls.delete.map((d) => d.path)).toEqual([`/items/${COLL}/91`]);
+    expect(res.some((r) => r.action === "skipped" && /referenced by listings_x/.test(r.reason ?? "") && r.label.endsWith("[90]"))).toBe(true);
+  });
+
+  it("reference-aware prune: a failed reference check fails safe (skips, never deletes)", async () => {
+    writeSeed(
+      [{ categories_id: 1, languages_code: "en-US", title: "keep" }],
+      { match_on: NAT, delete: true, referenced_by: [{ table: "boom", column: "x" }] },
+    );
+    const server = [
+      { id: 1, categories_id: 1, languages_code: "en-US", title: "keep" },
+      { id: 92, categories_id: 7, languages_code: "en-US", title: "extra" },
+    ];
+    const base = mockClient(server, "id");
+    // Make the reference lookup throw.
+    const client: DirectusClient = {
+      ...base.client,
+      async get(path) {
+        if (path.startsWith("/items/boom")) throw new Error("500 boom");
+        return base.client.get(path);
+      },
+    };
+    const res = await reconcileSeeds({ seedDir: dir, client, opts: { dryRun: false, prune: true } });
+    expect(base.calls.delete).toHaveLength(0); // nothing deleted — could not verify safety
+    expect(res.some((r) => r.action === "skipped" && r.label.endsWith("[92]"))).toBe(true);
   });
 
   it("fails the extras check when two files for one collection disagree on match_on", async () => {
