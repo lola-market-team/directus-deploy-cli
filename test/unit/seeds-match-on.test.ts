@@ -112,4 +112,37 @@ describe("reconcileSeeds match_on (natural-key identity)", () => {
     expect(calls.post).toHaveLength(1);
     expect(calls.post[0].body).toHaveProperty("id", 999);
   });
+
+  it("refuses (fails) when the server already has duplicate rows for a match key", async () => {
+    writeSeed(
+      [{ categories_id: 1, languages_code: "en-US", title: "X" }],
+      { match_on: NAT, delete: true },
+    );
+    const { client, calls } = mockClient([
+      { id: 1, categories_id: 1, languages_code: "en-US", title: "X" },
+      { id: 2, categories_id: 1, languages_code: "en-US", title: "X-dup" }, // same key
+    ]);
+    const res = await reconcileSeeds({ seedDir: dir, client, opts: { dryRun: false, prune: true } });
+    // Loud failure, and NOTHING written/pruned against the ambiguous state.
+    expect(res.some((r) => r.action === "failed" && /duplicate server/.test(r.reason ?? ""))).toBe(true);
+    expect(calls.post).toHaveLength(0);
+    expect(calls.patch).toHaveLength(0);
+    expect(calls.delete).toHaveLength(0);
+  });
+
+  it("fails the extras check when two files for one collection disagree on match_on", async () => {
+    // Same collection, two files: one natural-key, one pk. Mixing identities in
+    // the aggregated seedKeys would prune correct rows; the guard blocks it.
+    writeFileSync(
+      join(dir, `${COLL}.a.json`),
+      JSON.stringify({ collection: COLL, meta: { insert_order: 1, match_on: NAT, delete: true }, data: [{ categories_id: 1, languages_code: "en-US", title: "X" }] }),
+    );
+    writeFileSync(
+      join(dir, `${COLL}.b.json`),
+      JSON.stringify({ collection: COLL, meta: { insert_order: 2, delete: true }, data: [{ id: 7, categories_id: 2, languages_code: "de-DE", title: "Y" }] }),
+    );
+    const { client } = mockClient([{ id: 1, categories_id: 1, languages_code: "en-US", title: "X" }]);
+    const res = await reconcileSeeds({ seedDir: dir, client, opts: { dryRun: false, prune: true } });
+    expect(res.some((r) => r.action === "failed" && /disagree on match_on/.test(r.reason ?? ""))).toBe(true);
+  });
 });
