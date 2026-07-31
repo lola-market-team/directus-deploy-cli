@@ -145,10 +145,10 @@ export function createDirectusClient(cfg) {
             if (!r.ok)
                 throw toErr(r.url, r.status, await r.text());
         },
-        async postRaw(path, body) {
+        async postRaw(path, body, extraHeaders) {
             const r = await fetchWithRetry(base + path, {
                 method: "POST",
-                headers,
+                headers: extraHeaders ? { ...headers, ...extraHeaders } : headers,
                 body: JSON.stringify(body ?? {}),
             });
             if (!r.ok)

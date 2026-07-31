@@ -36,6 +36,7 @@ export async function run(input) {
             migrationsDir: input.migrationsDir,
             extensionsDir: input.extensionsDir,
             includeExtensions: input.includeExtensions,
+            sqlRunnerToken: input.sqlRunnerToken,
             client: input.client,
             opts: input.opts,
         })));

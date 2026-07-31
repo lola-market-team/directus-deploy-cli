@@ -24,15 +24,24 @@ interface FakeRawQuery {
   client: DirectusClient;
   tracker: Map<string, string>; // filename → sha256
   executedStatements: string[];
+  sqlRunnerCalls: Array<{ sql: string; wrap: unknown; token?: string }>;
   probeAvailable: boolean;
 }
 
 function makeMockClient(opts: { probeAvailable?: boolean; preSeed?: Map<string, string> } = {}): FakeRawQuery {
   const tracker = new Map(opts.preSeed ?? []);
   const executedStatements: string[] = [];
+  const sqlRunnerCalls: Array<{ sql: string; wrap: unknown; token?: string }> = [];
   const probeAvailable = opts.probeAvailable ?? true;
 
-  const postRaw = vi.fn(async (path: string, body: unknown) => {
+  const postRaw = vi.fn(async (path: string, body: unknown, headers?: Record<string, string>) => {
+    // Whole-file execution path (wrap:false). Records the call so tests can
+    // assert routing + header, then reports success like the real endpoint.
+    if (path === "/sql-runner/execute") {
+      const b = body as { sql?: string; wrap?: unknown };
+      sqlRunnerCalls.push({ sql: b?.sql ?? "", wrap: b?.wrap, token: headers?.["x-sql-runner-token"] });
+      return { success: true, durationMs: 1 };
+    }
     if (path !== "/raw-query/execute") return {};
     const query = (body as { query?: string })?.query ?? "";
 
@@ -78,7 +87,7 @@ function makeMockClient(opts: { probeAvailable?: boolean; preSeed?: Map<string, 
     postRaw,
   };
 
-  return { client, tracker, executedStatements, probeAvailable };
+  return { client, tracker, executedStatements, sqlRunnerCalls, probeAvailable };
 }
 
 describe("reconcileMigrations", () => {
@@ -111,6 +120,82 @@ describe("reconcileMigrations", () => {
     expect(results).toEqual([{ kind: "migrations", label: "migrations/002.sql", action: "created" }]);
     expect(fake.executedStatements).toEqual(["CREATE TABLE IF NOT EXISTS y (id int);"]);
     expect(fake.tracker.get("002.sql")).toBe(sha256(body));
+  });
+
+  it("with sqlRunnerToken, sends the WHOLE file to /sql-runner/execute (wrap:false) — never per-statement raw-query", async () => {
+    // A self-transacting, dollar-quoted file: the exact shape the raw-query
+    // per-statement path chokes on. Multiple statements, one sql-runner call.
+    const body = [
+      "BEGIN;",
+      "CREATE OR REPLACE FUNCTION f() RETURNS trigger AS $$ BEGIN RETURN NEW; END $$ LANGUAGE plpgsql;",
+      "COMMIT;",
+    ].join("\n");
+    const dir = await writeMigrations({ "075.sql": body });
+    const fake = makeMockClient();
+
+    const results = await reconcileMigrations({
+      migrationsDir: dir,
+      client: fake.client,
+      opts: { dryRun: false },
+      sqlRunnerToken: "runner-secret",
+    });
+
+    expect(results).toEqual([{ kind: "migrations", label: "migrations/075.sql", action: "created" }]);
+    // Executed as one whole-file call, with wrap:false and the token header.
+    expect(fake.sqlRunnerCalls).toEqual([{ sql: body, wrap: false, token: "runner-secret" }]);
+    // The per-statement raw-query execution path was NOT used.
+    expect(fake.executedStatements).toEqual([]);
+    // Tracker still recorded (via raw-query INSERT).
+    expect(fake.tracker.get("075.sql")).toBe(sha256(normalizeSqlForHash(body)));
+  });
+
+  it("without sqlRunnerToken, still uses the per-statement raw-query path (back-compat)", async () => {
+    const body = "CREATE TABLE IF NOT EXISTS legacy (id int);";
+    const dir = await writeMigrations({ "002b.sql": body });
+    const fake = makeMockClient();
+
+    const results = await reconcileMigrations({
+      migrationsDir: dir,
+      client: fake.client,
+      opts: { dryRun: false },
+    });
+
+    expect(results).toEqual([{ kind: "migrations", label: "migrations/002b.sql", action: "created" }]);
+    expect(fake.sqlRunnerCalls).toEqual([]);
+    expect(fake.executedStatements).toEqual([body]);
+  });
+
+  it("with sqlRunnerToken, a sql-runner failure fails the file and skips the tracker insert", async () => {
+    const body = "CREATE TABLE broken (id int);";
+    const dir = await writeMigrations({ "076.sql": body });
+    const fake = makeMockClient();
+    (fake.client.postRaw as ReturnType<typeof vi.fn>).mockImplementation(
+      async (path: string, b: unknown, headers?: Record<string, string>) => {
+        if (path === "/sql-runner/execute") {
+          fake.sqlRunnerCalls.push({
+            sql: (b as { sql?: string }).sql ?? "",
+            wrap: (b as { wrap?: unknown }).wrap,
+            token: headers?.["x-sql-runner-token"],
+          });
+          return { success: false, rolledBack: true, error: "boom in the migration" };
+        }
+        const q = (b as { query?: string }).query ?? "";
+        if (/^SELECT\s+1\s+AS\s+ok/i.test(q.trim())) return { success: true, results: [{ success: true, data: [{ ok: 1 }] }] };
+        return { success: true, results: [{ success: true, data: [] }] };
+      },
+    );
+
+    const results = await reconcileMigrations({
+      migrationsDir: dir,
+      client: fake.client,
+      opts: { dryRun: false },
+      sqlRunnerToken: "runner-secret",
+    });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.action).toBe("failed");
+    expect(results[0]!.reason).toMatch(/boom in the migration/);
+    expect(fake.tracker.has("076.sql")).toBe(false);
   });
 
   it("fails hard when hash differs from tracker (MUTATED — never rewrites silently)", async () => {
