@@ -29,6 +29,7 @@ export interface RunInput {
   migrationsDir?: string;
   extensionsDir?: string;
   includeExtensions?: boolean;
+  sqlRunnerToken?: string;
   seedDir?: string;
   client: DirectusClient;
   opts: ApplyOptions;
@@ -62,6 +63,7 @@ export async function run(input: RunInput): Promise<RunReport> {
         migrationsDir: input.migrationsDir,
         extensionsDir: input.extensionsDir,
         includeExtensions: input.includeExtensions,
+        sqlRunnerToken: input.sqlRunnerToken,
         client: input.client,
         opts: input.opts,
       })),

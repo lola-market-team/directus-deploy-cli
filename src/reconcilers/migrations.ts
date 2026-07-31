@@ -46,6 +46,13 @@ export interface MigrationReconcileInput {
   // for backward compatibility.
   extensionsDir?: string;
   includeExtensions?: boolean;
+  // When set, migration files execute through the sql-runner extension
+  // (/sql-runner/execute) instead of the retired /raw-query/execute. sql-runner
+  // runs the WHOLE file in one call (no re-splitting → $$ blocks and comment
+  // semicolons are safe) and, with wrap:false, lets a file own its own
+  // BEGIN/COMMIT. Absent (no token in env) → fall back to the per-statement
+  // raw-query path, which still works for migrations without $$.
+  sqlRunnerToken?: string;
 }
 
 interface RawQueryResult {
@@ -62,6 +69,33 @@ async function rawQuery(client: DirectusClient, sql: string): Promise<RawQueryRe
     const msg = (e as Error).message;
     if (msg.includes(" 404 ")) return null;
     throw e;
+  }
+}
+
+// Execute a whole migration file via the sql-runner extension. Unlike
+// raw-query, the file arrives as one string (no re-splitting, so $$ blocks and
+// ';' in comments are safe) and wrap:false lets the file keep its own
+// BEGIN/COMMIT. sql-runner replies { success, error?, rolledBack? } at the
+// response root (not under .data), so postRaw's untouched body is what we read.
+async function sqlRunnerExec(
+  client: DirectusClient,
+  token: string,
+  sql: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const r = await client.postRaw(
+      "/sql-runner/execute",
+      { sql, wrap: false },
+      { "x-sql-runner-token": token },
+    );
+    if (r && (r as { success?: unknown }).success === true) return { ok: true };
+    const error = String((r as { error?: unknown })?.error ?? "sql-runner reported failure");
+    return { ok: false, error };
+  } catch (e) {
+    // A non-2xx (e.g. 400 rolled-back, 403 bad token) surfaces here with the
+    // server's body in the message — hand it back rather than throwing, so one
+    // bad file fails just its own row like the raw-query path does.
+    return { ok: false, error: (e as Error).message };
   }
 }
 
@@ -333,12 +367,20 @@ export async function reconcileMigrations(
     }
 
     let failedReason: string | null = null;
-    for (const stmt of statements) {
-      const r = await rawQuery(input.client, stmt);
-      const inner = r?.results?.[0];
-      if (!r?.success || !inner?.success) {
-        failedReason = inner?.error ?? "unknown error";
-        break;
+    if (input.sqlRunnerToken) {
+      // Whole file, one call: sql-runner parses it (no re-split) so $$ blocks
+      // and self-managed BEGIN/COMMIT work. The 26 migrations with their own
+      // transaction control could never apply through the per-statement path.
+      const r = await sqlRunnerExec(input.client, input.sqlRunnerToken, file.raw);
+      if (!r.ok) failedReason = r.error;
+    } else {
+      for (const stmt of statements) {
+        const r = await rawQuery(input.client, stmt);
+        const inner = r?.results?.[0];
+        if (!r?.success || !inner?.success) {
+          failedReason = inner?.error ?? "unknown error";
+          break;
+        }
       }
     }
 

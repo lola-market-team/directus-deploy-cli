@@ -35,8 +35,13 @@ export interface DirectusClient {
   delete(path: string): Promise<void>;
   // Non-standard endpoints (/raw-query/execute, extension routes) return
   // their payload at the response root, not under `.data`. `postRaw` returns
-  // the full parsed body untouched.
-  postRaw(path: string, body: unknown): Promise<Record<string, unknown>>;
+  // the full parsed body untouched. `extraHeaders` carries per-call headers the
+  // base auth doesn't cover — e.g. the sql-runner endpoint's x-sql-runner-token.
+  postRaw(
+    path: string,
+    body: unknown,
+    extraHeaders?: Record<string, string>,
+  ): Promise<Record<string, unknown>>;
 }
 
 export interface ApplyOptions {

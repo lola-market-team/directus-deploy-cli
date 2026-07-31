@@ -46,6 +46,26 @@ async function rawQuery(client, sql) {
         throw e;
     }
 }
+// Execute a whole migration file via the sql-runner extension. Unlike
+// raw-query, the file arrives as one string (no re-splitting, so $$ blocks and
+// ';' in comments are safe) and wrap:false lets the file keep its own
+// BEGIN/COMMIT. sql-runner replies { success, error?, rolledBack? } at the
+// response root (not under .data), so postRaw's untouched body is what we read.
+async function sqlRunnerExec(client, token, sql) {
+    try {
+        const r = await client.postRaw("/sql-runner/execute", { sql, wrap: false }, { "x-sql-runner-token": token });
+        if (r && r.success === true)
+            return { ok: true };
+        const error = String(r?.error ?? "sql-runner reported failure");
+        return { ok: false, error };
+    }
+    catch (e) {
+        // A non-2xx (e.g. 400 rolled-back, 403 bad token) surfaces here with the
+        // server's body in the message — hand it back rather than throwing, so one
+        // bad file fails just its own row like the raw-query path does.
+        return { ok: false, error: e.message };
+    }
+}
 function stripLeadingComments(s) {
     let i = 0;
     while (true) {
@@ -283,12 +303,22 @@ export async function reconcileMigrations(input) {
             continue;
         }
         let failedReason = null;
-        for (const stmt of statements) {
-            const r = await rawQuery(input.client, stmt);
-            const inner = r?.results?.[0];
-            if (!r?.success || !inner?.success) {
-                failedReason = inner?.error ?? "unknown error";
-                break;
+        if (input.sqlRunnerToken) {
+            // Whole file, one call: sql-runner parses it (no re-split) so $$ blocks
+            // and self-managed BEGIN/COMMIT work. The 26 migrations with their own
+            // transaction control could never apply through the per-statement path.
+            const r = await sqlRunnerExec(input.client, input.sqlRunnerToken, file.raw);
+            if (!r.ok)
+                failedReason = r.error;
+        }
+        else {
+            for (const stmt of statements) {
+                const r = await rawQuery(input.client, stmt);
+                const inner = r?.results?.[0];
+                if (!r?.success || !inner?.success) {
+                    failedReason = inner?.error ?? "unknown error";
+                    break;
+                }
             }
         }
         if (failedReason) {

@@ -62,12 +62,41 @@ function resolveTargetCredentials(
   return { url: entry.base_url, token, label: name };
 }
 
+// Token for the sql-runner extension's /sql-runner/execute endpoint (distinct
+// from the Directus admin token — see the extension's guard). Migrations route
+// through sql-runner only when this resolves; otherwise the reconciler falls
+// back to the raw-query path. Resolution order:
+//   1. SQL_RUNNER_TOKEN — generic override, also the only path when --url is
+//      used without a named target.
+//   2. per-target `sql_runner_token_env` field in the targets file, else
+//   3. SQL_RUNNER_<UPPER>_TOKEN convention (e.g. SQL_RUNNER_TEST_TOKEN).
+function resolveSqlRunnerToken(
+  target: string | undefined,
+  targetsFile: string,
+): string | undefined {
+  if (process.env.SQL_RUNNER_TOKEN) return process.env.SQL_RUNNER_TOKEN;
+  if (!target) return undefined;
+  let tokenEnv = `SQL_RUNNER_${target.toUpperCase()}_TOKEN`;
+  if (existsSync(targetsFile)) {
+    try {
+      const parsed = JSON.parse(readFileSync(targetsFile, "utf8")) as {
+        targets?: Record<string, { sql_runner_token_env?: string }>;
+      };
+      const field = parsed.targets?.[target]?.sql_runner_token_env;
+      if (field) tokenEnv = field;
+    } catch {
+      /* fall through to the convention */
+    }
+  }
+  return process.env[tokenEnv];
+}
+
 function resolveConnection(opts: {
   url?: string;
   token?: string;
   target?: string;
   targetsFile?: string;
-}): { url: string; token: string; target: string } {
+}): { url: string; token: string; target: string; sqlRunnerToken?: string } {
   let url = opts.url ?? process.env.DIRECTUS_URL;
   let token = opts.token ?? process.env.DIRECTUS_TOKEN;
   let label = opts.target;
@@ -86,7 +115,12 @@ function resolveConnection(opts: {
   if (!token) {
     throw new Error("--token or DIRECTUS_TOKEN required (or --target <name> matching targets file)");
   }
-  return { url, token, target: label ?? new URL(url).hostname };
+  return {
+    url,
+    token,
+    target: label ?? new URL(url).hostname,
+    sqlRunnerToken: resolveSqlRunnerToken(label, targetsFile),
+  };
 }
 
 const KNOWN_ENTITIES = [
@@ -139,6 +173,7 @@ function readCommon(flags: CommonFlags): {
   url: string;
   token: string;
   target: string;
+  sqlRunnerToken?: string;
   entities: Set<Entity>;
   onlyCollections?: Set<string>;
   snapshotDir: string;
@@ -150,7 +185,7 @@ function readCommon(flags: CommonFlags): {
   seedDir: string;
   json: boolean;
 } {
-  const { url, token, target } = resolveConnection(flags);
+  const { url, token, target, sqlRunnerToken } = resolveConnection(flags);
   const entities = parseEntities(flags.entities);
   const onlyCollections = flags.onlyCollections
     ? new Set(flags.onlyCollections.split(",").map((s) => s.trim()).filter(Boolean))
@@ -159,6 +194,7 @@ function readCommon(flags: CommonFlags): {
     url,
     token,
     target,
+    sqlRunnerToken,
     entities,
     onlyCollections,
     snapshotDir: flags.snapshotDir,
@@ -192,6 +228,7 @@ async function execute(mode: ExecuteOptions, flags: CommonFlags): Promise<number
     migrationsDir: common.migrationsDir,
     extensionsDir: common.extensionsDir,
     includeExtensions: common.includeExtensions,
+    sqlRunnerToken: common.sqlRunnerToken,
     seedDir: common.seedDir,
     client,
     opts,
