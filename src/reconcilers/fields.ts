@@ -21,6 +21,23 @@ function stripFkKeys(
   return out;
 }
 
+// A definition that cannot correspond to a real column, and so can never
+// collide with the DDL a migration owns. Two shapes qualify:
+//   schema === null          — alias fields: o2m/m2m, presentation
+//   special includes no-data — computed fields an extension hydrates at read
+//                              time (their snapshot JSON may still carry a
+//                              vestigial schema block from an env where the
+//                              column got created by hand).
+// A definition with a real schema block and no column is NOT column-less:
+// that is a missing migration, and creating the column here would be the
+// double-write hazard CLAUDE.md warns about.
+function isColumnless(desired: Record<string, unknown>): boolean {
+  if (desired["schema"] === null) return true;
+  const meta = desired["meta"] as Record<string, unknown> | null | undefined;
+  const special = meta?.["special"];
+  return Array.isArray(special) && special.includes("no-data");
+}
+
 export interface FieldReconcileInput {
   fieldsByCollection: Map<string, Record<string, unknown>[]>;
   registerManifests: Set<string>;
@@ -33,20 +50,33 @@ export async function reconcileFields(input: FieldReconcileInput): Promise<Entit
   for (const [collection, fields] of input.fieldsByCollection) {
     if (input.opts.onlyCollections && !input.opts.onlyCollections.has(collection)) continue;
 
-    // Adopted raw-SQL tables — register-table.mjs owns the fields; skipping
-    // avoids the classic "PATCH with type=unknown" cascade that broke pgvector
-    // embeddings on test/staging.
-    if (input.registerManifests.has(collection)) {
-      results.push({
-        kind: "fields",
-        label: `fields/${collection}/*`,
-        action: "skipped",
-        reason: "raw-SQL adopted — owned by register-table",
-      });
-      continue;
+    // Adopted raw-SQL tables — the register reconciler owns the *columns*;
+    // skipping them avoids the classic "PATCH with type=unknown" cascade that
+    // broke pgvector embeddings on test/staging.
+    //
+    // Column-less definitions are the exception and must still be applied.
+    // The register reconciler sources its work from information_schema.columns,
+    // so a field with no column behind it is invisible to it — and the fields
+    // reconciler used to skip the whole collection, leaving nothing on the
+    // deploy path able to create one. That hole is how the computed `rentals`
+    // fields (quote_amount_cents & co.) reached prod unregistered: the
+    // definitions were in git the entire time, and every apply reported clean.
+    const adopted = input.registerManifests.has(collection);
+    let pending = fields;
+    if (adopted) {
+      pending = fields.filter(isColumnless);
+      const owned = fields.length - pending.length;
+      if (owned > 0) {
+        results.push({
+          kind: "fields",
+          label: `fields/${collection}/*`,
+          action: "skipped",
+          reason: `raw-SQL adopted — ${owned} column-backed field(s) owned by register-table`,
+        });
+      }
     }
 
-    for (const desired of fields) {
+    for (const desired of pending) {
       const field = String((desired as { field?: unknown }).field ?? "");
       if (!field) continue;
       const label = `fields/${collection}.${field}`;
@@ -87,6 +117,13 @@ export async function reconcileFields(input: FieldReconcileInput): Promise<Entit
 
       const payload = sanitizeForWrite(desired as Record<string, unknown>);
       const desiredMeta = (payload.meta as Record<string, unknown> | undefined) ?? {};
+
+      // Never send a schema block for a column-less field, even when the
+      // snapshot JSON carries one. Directus reads `schema` as an instruction to
+      // create the column, so forwarding a vestigial block turns a computed
+      // field into a real column shadowed by the read hook that hydrates it —
+      // and a permanent double-write against whatever else owns that table.
+      if (isColumnless(desired as Record<string, unknown>)) payload["schema"] = null;
 
       // Only send schema when it *actually* differs. Re-asserting unchanged
       // schema on PK / sequence-backed columns makes Directus emit

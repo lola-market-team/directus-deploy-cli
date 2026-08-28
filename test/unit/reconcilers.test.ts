@@ -229,6 +229,68 @@ describe("reconcileFields", () => {
     expect(client.patch).not.toHaveBeenCalled();
   });
 
+  it("creates column-less fields on register-manifest-owned tables", async () => {
+    // The register reconciler sources its work from information_schema.columns,
+    // so nothing but this path can create a no-data field on an adopted table.
+    // Skipping the whole collection is what left the computed `rentals` fields
+    // unregistered on prod while every apply reported clean.
+    const client = mockClient({ get: vi.fn(async () => null) });
+    const fields = new Map<string, Record<string, unknown>[]>();
+    fields.set("rentals", [
+      { collection: "rentals", field: "period", type: "string", meta: { hidden: true } },
+      {
+        collection: "rentals",
+        field: "quote_amount_cents",
+        type: "integer",
+        meta: { special: ["no-data"], readonly: true },
+        schema: { data_type: "integer", table: "rentals" },
+      },
+    ]);
+    const results = await reconcileFields({
+      fieldsByCollection: fields,
+      registerManifests: new Set(["rentals"]),
+      client,
+      opts: { dryRun: false },
+    });
+
+    // The column-backed field is still register's to own, and says so.
+    expect(results[0]!.action).toBe("skipped");
+    expect(results[0]!.reason).toMatch(/1 column-backed field/);
+    // The computed one gets created.
+    expect(results[1]).toMatchObject({
+      label: "fields/rentals.quote_amount_cents",
+      action: "created",
+    });
+    const [path, body] = (client.post as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(path).toBe("/fields/rentals");
+    // schema:null, not the vestigial block — sending it would make Directus
+    // ADD COLUMN and shadow the value the read hook injects.
+    expect((body as Record<string, unknown>).schema).toBeNull();
+  });
+
+  it("strips a vestigial schema block from a no-data field on a normal table", async () => {
+    const client = mockClient({ get: vi.fn(async () => null) });
+    const fields = new Map<string, Record<string, unknown>[]>();
+    fields.set("listings", [
+      {
+        collection: "listings",
+        field: "free_cancellable",
+        type: "boolean",
+        meta: { special: ["no-data"] },
+        schema: { data_type: "boolean", table: "listings" },
+      },
+    ]);
+    const results = await reconcileFields({
+      fieldsByCollection: fields,
+      registerManifests: new Set(),
+      client,
+      opts: { dryRun: false },
+    });
+    expect(results[0]!.action).toBe("created");
+    const body = (client.post as ReturnType<typeof vi.fn>).mock.calls[0][1] as Record<string, unknown>;
+    expect(body.schema).toBeNull();
+  });
+
   it("omits schema on PATCH when schema matches", async () => {
     const client = mockClient({
       get: vi.fn(async () => ({
