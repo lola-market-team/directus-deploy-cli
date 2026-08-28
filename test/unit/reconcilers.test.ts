@@ -263,12 +263,16 @@ describe("reconcileFields", () => {
     });
     const [path, body] = (client.post as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(path).toBe("/fields/rentals");
-    // schema:null, not the vestigial block — sending it would make Directus
-    // ADD COLUMN and shadow the value the read hook injects.
-    expect((body as Record<string, unknown>).schema).toBeNull();
+    // The schema block rides along. Stripping it would not stop Directus
+    // creating the column (it derives that from `type`) — it would only let
+    // the column's attributes drift from the snapshot.
+    expect((body as Record<string, unknown>).schema).toEqual({
+      data_type: "integer",
+      table: "rentals",
+    });
   });
 
-  it("strips a vestigial schema block from a no-data field on a normal table", async () => {
+  it("keeps the schema block on a no-data field on a normal table", async () => {
     const client = mockClient({ get: vi.fn(async () => null) });
     const fields = new Map<string, Record<string, unknown>[]>();
     fields.set("listings", [
@@ -288,7 +292,7 @@ describe("reconcileFields", () => {
     });
     expect(results[0]!.action).toBe("created");
     const body = (client.post as ReturnType<typeof vi.fn>).mock.calls[0][1] as Record<string, unknown>;
-    expect(body.schema).toBeNull();
+    expect(body.schema).toEqual({ data_type: "boolean", table: "listings" });
   });
 
   it("omits schema on PATCH when schema matches", async () => {
@@ -398,8 +402,8 @@ describe("reconcileFields", () => {
     expect(client.patch).not.toHaveBeenCalled();
   });
 
-  it("skips entire collection when register-manifest exists", async () => {
-    const client = mockClient();
+  it("defers column-backed fields when register-manifest exists, and writes nothing", async () => {
+    const client = mockClient({ get: vi.fn(async () => [{ field: "id" }]) });
     const fields = new Map<string, Record<string, unknown>[]>();
     fields.set("owner_earnings", [{ field: "id" }]);
     const results = await reconcileFields({
@@ -409,7 +413,46 @@ describe("reconcileFields", () => {
       opts: { dryRun: false },
     });
     expect(results[0]!.action).toBe("skipped");
-    expect(client.get).not.toHaveBeenCalled();
+    // The only read is the receipt's collection-level GET; no per-field
+    // traffic, and nothing is written.
+    expect(client.get).toHaveBeenCalledWith("/fields/owner_earnings");
+    expect(client.patch).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
+  });
+
+  it("fails when a deferred field never got registered", async () => {
+    // The #643 shape: git defines the field, the manifest defers it to
+    // register, register only walks real columns, and nobody creates it.
+    // Without this receipt the run reports `skipped` and looks clean.
+    const client = mockClient({ get: vi.fn(async () => [{ field: "id" }]) });
+    const fields = new Map<string, Record<string, unknown>[]>();
+    fields.set("rentals", [{ field: "id" }, { field: "quote_amount_cents" }]);
+    const results = await reconcileFields({
+      fieldsByCollection: fields,
+      registerManifests: new Set(["rentals"]),
+      client,
+      opts: { dryRun: false },
+    });
+    const receipt = results.find((r) => r.label.includes("registration receipt"));
+    expect(receipt).toMatchObject({ action: "failed" });
+    expect(receipt!.reason).toMatch(/quote_amount_cents/);
+    expect(receipt!.reason).toMatch(/claimed by nobody/);
+  });
+
+  it("stays silent when every deferred field is present", async () => {
+    const client = mockClient({
+      get: vi.fn(async () => [{ field: "id" }, { field: "amount_cents" }]),
+    });
+    const fields = new Map<string, Record<string, unknown>[]>();
+    fields.set("rentals", [{ field: "id" }, { field: "amount_cents" }]);
+    const results = await reconcileFields({
+      fieldsByCollection: fields,
+      registerManifests: new Set(["rentals"]),
+      client,
+      opts: { dryRun: false },
+    });
+    expect(results.find((r) => r.label.includes("registration receipt"))).toBeUndefined();
+    expect(results.every((r) => r.action !== "failed")).toBe(true);
   });
 });
 

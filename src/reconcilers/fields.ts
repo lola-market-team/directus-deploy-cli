@@ -21,17 +21,29 @@ function stripFkKeys(
   return out;
 }
 
-// A definition that cannot correspond to a real column, and so can never
-// collide with the DDL a migration owns. Two shapes qualify:
-//   schema === null          — alias fields: o2m/m2m, presentation
+// A definition the register reconciler can never create. It sources its work
+// from information_schema.columns, so anything without a column on a fresh
+// target is permanently outside its reach. Two shapes qualify:
+//
+//   schema === null          — alias fields: o2m/m2m, presentation. These
+//                              genuinely never get a column.
 //   special includes no-data — computed fields an extension hydrates at read
-//                              time (their snapshot JSON may still carry a
-//                              vestigial schema block from an env where the
-//                              column got created by hand).
-// A definition with a real schema block and no column is NOT column-less:
-// that is a missing migration, and creating the column here would be the
-// double-write hazard CLAUDE.md warns about.
-function isColumnless(desired: Record<string, unknown>): boolean {
+//                              time. These DO get a real column (see below),
+//                              but only as a side effect of the POST that
+//                              creates the field — so until someone applies
+//                              the definition, register has nothing to find.
+//
+// Measured against a live Directus on 2026-08-28, POST /fields/rentals:
+//   type=integer, special=[no-data], schema=null  -> column CREATED, and the
+//                                                    field is selectable
+//   type=alias,   special=[no-data], schema=null  -> no column, and the field
+//                                                    403s on select
+// Directus derives the column from `type`; schema absent, null, or populated
+// all create one. Only an alias type avoids it, and an alias cannot be read
+// back. So a computed field IS a real nullable column that a read hook
+// overwrites on the way out — do not "fix" that by stripping schema, which
+// only makes the column's attributes drift from the snapshot.
+function isRegisterInvisible(desired: Record<string, unknown>): boolean {
   if (desired["schema"] === null) return true;
   const meta = desired["meta"] as Record<string, unknown> | null | undefined;
   const special = meta?.["special"];
@@ -63,15 +75,19 @@ export async function reconcileFields(input: FieldReconcileInput): Promise<Entit
     // definitions were in git the entire time, and every apply reported clean.
     const adopted = input.registerManifests.has(collection);
     let pending = fields;
+    let deferred: string[] = [];
     if (adopted) {
-      pending = fields.filter(isColumnless);
-      const owned = fields.length - pending.length;
-      if (owned > 0) {
+      pending = fields.filter(isRegisterInvisible);
+      deferred = fields
+        .filter((f) => !isRegisterInvisible(f))
+        .map((f) => String((f as { field?: unknown }).field ?? ""))
+        .filter(Boolean);
+      if (deferred.length > 0) {
         results.push({
           kind: "fields",
           label: `fields/${collection}/*`,
           action: "skipped",
-          reason: `raw-SQL adopted — ${owned} column-backed field(s) owned by register-table`,
+          reason: `raw-SQL adopted — ${deferred.length} column-backed field(s) owned by register-table`,
         });
       }
     }
@@ -118,12 +134,11 @@ export async function reconcileFields(input: FieldReconcileInput): Promise<Entit
       const payload = sanitizeForWrite(desired as Record<string, unknown>);
       const desiredMeta = (payload.meta as Record<string, unknown> | undefined) ?? {};
 
-      // Never send a schema block for a column-less field, even when the
-      // snapshot JSON carries one. Directus reads `schema` as an instruction to
-      // create the column, so forwarding a vestigial block turns a computed
-      // field into a real column shadowed by the read hook that hydrates it —
-      // and a permanent double-write against whatever else owns that table.
-      if (isColumnless(desired as Record<string, unknown>)) payload["schema"] = null;
+      // Alias fields carry `schema: null` in the snapshot already; nothing to
+      // force. Computed (no-data) fields keep their schema block — it
+      // describes the column Directus creates for them either way, and
+      // sending it keeps that column matching the snapshot instead of
+      // Directus's defaults.
 
       // Only send schema when it *actually* differs. Re-asserting unchanged
       // schema on PK / sequence-backed columns makes Directus emit
@@ -180,6 +195,50 @@ export async function reconcileFields(input: FieldReconcileInput): Promise<Entit
         } else {
           results.push({ kind: "fields", label, action: "unchanged" });
         }
+      }
+    }
+
+    // Receipt for the fields handed to the register reconciler.
+    //
+    // The handoff above has no natural feedback: the two sides enumerate
+    // different universes — git holds field DEFINITIONS, register walks
+    // Postgres COLUMNS — and a `skipped` line is not drift, so a definition
+    // owned by nobody reads as success on every plan, verify and apply. That
+    // is precisely how prod ran seven weeks without the four computed
+    // `rentals` fields while their JSON sat in git the whole time.
+    //
+    // So assert the delegation was honoured: everything deferred must exist
+    // on the target once register has run. Only the deferred set is checked —
+    // fields this reconciler applies itself report their own outcome, and in
+    // a dry run they legitimately do not exist yet.
+    if (deferred.length > 0) {
+      const label = `fields/${collection} (registration receipt)`;
+      let rows: unknown;
+      try {
+        rows = await input.client.get(`/fields/${collection}`);
+      } catch (e) {
+        results.push({ kind: "fields", label, action: "failed", reason: (e as Error).message });
+        continue;
+      }
+      const present = new Set(
+        (Array.isArray(rows) ? rows : [])
+          .map((r) => String((r as { field?: unknown })?.field ?? ""))
+          .filter(Boolean),
+      );
+      const missing = deferred.filter((f) => !present.has(f));
+      if (missing.length > 0) {
+        results.push({
+          kind: "fields",
+          label,
+          action: "failed",
+          reason:
+            `defined in the snapshot but not registered on the target: ${missing.join(", ")}. ` +
+            `This collection has a register manifest, so the fields reconciler defers ` +
+            `column-backed fields to register — but register only walks real Postgres ` +
+            `columns. A definition with no column is claimed by nobody. Add the migration ` +
+            `that creates the column, or make the definition column-less (schema: null for ` +
+            `an alias, special: ["no-data"] for a computed field); do not leave it unowned.`,
+        });
       }
     }
   }
