@@ -38,7 +38,13 @@ async function loadFkConstraints(client, tables) {
         `ON ccu.constraint_name = tc.constraint_name AND ccu.table_schema = tc.table_schema ` +
         `WHERE tc.constraint_type = 'FOREIGN KEY' ` +
         `AND tc.table_schema = 'public' ` +
-        `AND tc.table_name IN (${inClause})`;
+        `AND tc.table_name IN (${inClause}) ` +
+        // Single-column FKs only. Directus relations are always one column; a
+        // composite FK sharing a column (e.g. (reply_to, feed_item) -> (id,
+        // feed_item) as a same-parent guard) would otherwise cross-join through
+        // constraint_column_usage and be misread as the column's FK drifting.
+        `AND (SELECT count(*) FROM information_schema.key_column_usage k2 ` +
+        `WHERE k2.constraint_name = tc.constraint_name AND k2.table_schema = tc.table_schema) = 1`;
     try {
         const r = (await client.postRaw("/raw-query/execute", { query }));
         const inner = r?.results?.[0];
