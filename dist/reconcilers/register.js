@@ -19,6 +19,27 @@ async function rawQuery(client, sql) {
         return { ok: false, data: [], error: msg };
     }
 }
+// Run a single write statement. When a sql-runner token is available, send it
+// through /sql-runner/execute (wrap:false) — that endpoint runs the whole
+// string in one shot with no ';' re-splitting, so a note/icon containing ';'
+// stays intact. Otherwise fall back to /raw-query/execute, which is safe only
+// when the statement has no embedded ';' (the caller guards that below).
+// Apostrophes are safe on both paths: sqlLiteral() escapes them to ''.
+async function execWrite(input, sql) {
+    if (input.sqlRunnerToken) {
+        try {
+            const r = (await input.client.postRaw("/sql-runner/execute", { sql, wrap: false }, { "x-sql-runner-token": input.sqlRunnerToken }));
+            if (r && r.success === true)
+                return { ok: true };
+            return { ok: false, error: String(r?.error ?? "sql-runner reported failure") };
+        }
+        catch (e) {
+            return { ok: false, error: e.message };
+        }
+    }
+    const r = await rawQuery(input.client, sql);
+    return { ok: r.ok, error: r.error };
+}
 function metaFor(dataType, name) {
     const t = dataType.toLowerCase();
     if (t === "uuid")
@@ -134,6 +155,22 @@ export async function reconcileRegister(input) {
             const hidden = cm.hidden === true;
             const iconExpr = cm.icon ? sqlLiteral(cm.icon) : "NULL";
             const noteExpr = cm.note ? sqlLiteral(cm.note) : "NULL";
+            // Without a sql-runner token the adopt INSERT goes through raw-query,
+            // which splits on ';'. A note/icon carrying ';' would be chopped
+            // mid-string and silently abort adoption. Fail loudly at author time
+            // instead of emitting SQL that breaks on the server. (With a token the
+            // statement runs unsplit, so any ';' is fine.)
+            if (!input.sqlRunnerToken && (cm.note?.includes(";") || cm.icon?.includes(";"))) {
+                results.push({
+                    kind: "migrations",
+                    label,
+                    action: "failed",
+                    reason: `collection_meta note/icon contains ';', which the raw-query endpoint splits on — ` +
+                        `set SQL_RUNNER_<TARGET>_TOKEN (or SQL_RUNNER_TOKEN) so the adopt INSERT routes ` +
+                        `through sql-runner, or remove ';' from the note`,
+                });
+                continue;
+            }
             if (input.opts.dryRun) {
                 results.push({
                     kind: "migrations",
@@ -143,7 +180,7 @@ export async function reconcileRegister(input) {
                 });
             }
             else {
-                const inserted = await rawQuery(input.client, `INSERT INTO directus_collections (collection, hidden, singleton, icon, note)
+                const inserted = await execWrite(input, `INSERT INTO directus_collections (collection, hidden, singleton, icon, note)
            VALUES (${sqlLiteral(table)}, ${hidden}, false, ${iconExpr}, ${noteExpr})
            ON CONFLICT (collection) DO NOTHING`);
                 if (!inserted.ok) {
