@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createDirectusClient } from "./http.js";
 import { run } from "./runner.js";
-import { diffExtensions, loadTargets } from "./extensions.js";
+import { diffExtensions, loadTargets, workspaceDepSrcPaths, extensionsByBundledPackage } from "./extensions.js";
 // Per-check deadline. Applies to every leg of a target check — git, HTTP
 // reconcilers, and drift probes alike. 0 disables. See #39: before this, one
 // wedged leg blocked the whole command with no output and no upper bound.
@@ -178,6 +178,9 @@ export async function computePromotionQueue(repoRoot, from, to, timeoutMs = OVER
         "directus_config",
         "migrations",
         "extensions",
+        // #50: a bundled @lola/* package change ships in its consumer extensions'
+        // bundles, so it must surface here — mapped to those extensions below.
+        "packages",
     ]);
     const entries = raw
         .split("\n")
@@ -188,14 +191,46 @@ export async function computePromotionQueue(repoRoot, from, to, timeoutMs = OVER
         return { status: status.charAt(0), path: rest.join("\t") };
     });
     const classified = classifyPromotionPaths(entries);
+    // #50: fold in extensions whose ONLY change in to..from is a bundled @lola/*
+    // package (classifyPromotionPaths keys on extensions/<name>/src, so those
+    // wouldn't otherwise appear). Map each changed packages/<base>/src/ to its
+    // dependent extensions via the reverse dep map.
+    //
+    // Two deliberate limits, matching the src-scoped artifact key this mirrors
+    // (advisory report, never affects exit code):
+    //   - Keyed on packages/<base>/src/ only — a package.json-only dep-edge change
+    //     isn't flagged (same reason the key excludes package.json: version bumps
+    //     would cause phantom churn).
+    //   - The reverse map is read from the WORKING TREE, so a bundling edge that
+    //     exists only on `from` is missed if overview runs checked out at `to`.
+    //     In practice overview runs from the `from` checkout, where it's correct.
+    const changedPackageBases = new Set();
+    for (const { path } of entries) {
+        const m = path.match(/^packages\/([^/]+)\/src\//);
+        if (m)
+            changedPackageBases.add(m[1]);
+    }
+    const extNames = new Set(classified.extensions);
+    if (changedPackageBases.size > 0) {
+        const byPackage = await extensionsByBundledPackage(repoRoot);
+        for (const base of changedPackageBases) {
+            for (const ext of byPackage.get(base) ?? [])
+                extNames.add(ext);
+        }
+    }
+    const promotionExtensions = [...extNames].sort();
     const commits = parseCommitLog(await g(["log", "--format=%h%x09%s", "-n", String(COMMIT_LIST_CAP), `${to}..${from}`]));
     const extensionDetails = [];
-    for (const name of classified.extensions) {
+    for (const name of promotionExtensions) {
         // Same pathspec as resolveArtifactSourceCommit — the bucket filename /
-        // /_meta.sourceCommit convention.
+        // /_meta.sourceCommit convention — PLUS the src/ of every bundled @lola/*
+        // package (#50), so `expected` tracks package changes like the deployed
+        // key now does. Working-tree dep set (advisory).
+        const depSrcs = await workspaceDepSrcPaths(repoRoot, name);
         const pathspec = [
             "--",
             `extensions/${name}`,
+            ...depSrcs,
             `:!extensions/${name}/dist`,
             `:!extensions/${name}/src/build-info.ts`,
         ];
@@ -223,6 +258,7 @@ export async function computePromotionQueue(repoRoot, from, to, timeoutMs = OVER
         commits,
         commitsTruncated: ahead > COMMIT_LIST_CAP,
         ...classified,
+        extensions: promotionExtensions, // includes package-only-changed consumers (#50)
         extensionDetails,
     };
 }

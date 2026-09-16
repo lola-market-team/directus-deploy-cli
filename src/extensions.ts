@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 
 // Extension deploy over plain SSH.
 //
@@ -128,6 +129,30 @@ export async function workspaceDepSrcPaths(
   }
   await visit(join(repoRoot, "extensions", extName, "package.json"));
   return [...seen].sort().map((base) => `packages/${base}/src`);
+}
+
+// Reverse of workspaceDepSrcPaths: for each @lola/* package (by base name),
+// which extensions transitively bundle it. Lets overview map a package-only
+// change to the extensions that need re-promotion — the drift that stayed
+// invisible in #50/#841. Working-tree scan (advisory).
+export async function extensionsByBundledPackage(
+  repoRoot: string,
+): Promise<Map<string, string[]>> {
+  let exts: string[];
+  try {
+    exts = await readdir(join(repoRoot, "extensions"));
+  } catch {
+    return new Map();
+  }
+  const acc = new Map<string, Set<string>>();
+  for (const ext of exts) {
+    if (!existsSync(join(repoRoot, "extensions", ext, "package.json"))) continue;
+    for (const p of await workspaceDepSrcPaths(repoRoot, ext)) {
+      const base = p.replace(/^packages\//, "").replace(/\/src$/, "");
+      (acc.get(base) ?? acc.set(base, new Set()).get(base)!).add(ext);
+    }
+  }
+  return new Map([...acc].map(([k, v]) => [k, [...v].sort()]));
 }
 
 async function resolveSourceCommit(repoRoot: string, extName: string): Promise<string> {
@@ -1033,6 +1058,55 @@ async function gitTreeHash(repoRoot: string, ref: string, path: string): Promise
   return line && /^[0-9a-f]{40}$/.test(line) ? line : null;
 }
 
+// Resolve the git tree/blob hash of several paths at one ref in a SINGLE
+// subprocess. `git rev-parse ref:a ref:b …` prints one hash per line when they
+// all exist; if any is missing it exits non-zero and the 1:1 line mapping is
+// unsafe, so fall back to per-path gitTreeHash (which tolerates absence).
+// Avoids the (1 + deps) × branches spawn blow-up in branchHintForTreeHash.
+async function treeHashesAt(
+  repoRoot: string,
+  ref: string,
+  paths: string[],
+): Promise<Map<string, string | null>> {
+  const clean = paths.map((p) => p.replace(/\/+$/, ""));
+  const r = await runCommand("git", ["-C", repoRoot, "rev-parse", ...clean.map((p) => `${ref}:${p}`)]);
+  if (r.code === 0) {
+    const lines = r.stdout.trim().split("\n").map((s) => s.trim());
+    if (lines.length === clean.length && lines.every((l) => /^[0-9a-f]{40}$/.test(l))) {
+      return new Map(clean.map((p, i) => [p, lines[i]!]));
+    }
+  }
+  const out = new Map<string, string | null>();
+  for (const p of clean) out.set(p, await gitTreeHash(repoRoot, ref, p));
+  return out;
+}
+
+// Content hash over an extension's BUNDLE closure: its own src/ PLUS the src/
+// of every @lola/* package it bundles (#50). Two deploys with the same closure
+// hash ship byte-identical bundles; a change to a bundled package moves it even
+// when the ext's own src is untouched — so overview stops reporting "match" on
+// a stale-because-of-a-package bundle. Returns null only when the ext's own src
+// is absent at `ref` (the extension doesn't exist there); a bundled package
+// absent at `ref` (didn't exist at an old deployed commit) folds in as a stable
+// "absent" marker rather than nulling the whole closure. Always a uniform
+// sha256 digest — never a raw 40-hex tree hash — so a caller can never
+// accidentally compare it against a bare `git rev-parse` output. `depSrcs` is
+// the ext's package src paths (workspaceDepSrcPaths), resolved from the working
+// tree — deps are stable and this feeds an advisory, exit-code-free report.
+async function closureTreeHash(
+  repoRoot: string,
+  ref: string,
+  ext: string,
+  depSrcs: string[],
+): Promise<string | null> {
+  const extSrc = `extensions/${ext}/src`;
+  const paths = [extSrc, ...depSrcs];
+  const hashes = await treeHashesAt(repoRoot, ref, paths);
+  if (!hashes.get(extSrc)) return null; // extension doesn't exist at this ref
+  const parts = paths.map((p) => `${p}=${hashes.get(p) ?? "absent"}`);
+  return createHash("sha256").update(parts.sort().join("\n")).digest("hex");
+}
+
 // When content differs, we still want a hint about what's running. Prefer
 // a branch that has EXACTLY the same tree hash for this ext — that identifies
 // the WIP branch directly, without listing every branch that happens to
@@ -1042,6 +1116,7 @@ async function branchHintForTreeHash(
   ext: string,
   treeHash: string,
   reference: string,
+  depSrcs: string[],
 ): Promise<string | null> {
   // List all remote branches; short-circuit on empty.
   const r = await runCommand("git", ["-C", repoRoot, "for-each-ref", "--format=%(refname)", "refs/remotes/"]);
@@ -1051,10 +1126,11 @@ async function branchHintForTreeHash(
     .map((s) => s.trim())
     .filter((s) => s.length > 0 && !s.endsWith("/HEAD") && s !== `refs/remotes/${reference.replace(/^origin\//, "origin/")}`);
 
-  const path = `extensions/${ext}/src`;
+  // Same closure hash cachedTreeHash uses, or a branch that only differs in a
+  // bundled package would never match the deployed closure hash.
   const matches: string[] = [];
   for (const ref of branches) {
-    const h = await gitTreeHash(repoRoot, ref, path);
+    const h = await closureTreeHash(repoRoot, ref, ext, depSrcs);
     if (h === treeHash) matches.push(ref.replace(/^refs\/remotes\//, ""));
   }
   if (matches.length === 0) return null;
@@ -1082,10 +1158,17 @@ export async function diffExtensions(input: DiffInput): Promise<DiffReport> {
   // don't ship to the built bundle. Consistent with build-info's stamp,
   // which computes sourceCommit from `git log -- src`.
   const treeHashCache = new Map<string, string | null>();
+  // Bundled-package src paths per ext, resolved once (working tree). Folded
+  // into the content hash so a bundled @lola/* change registers as drift (#50).
+  const depSrcsCache = new Map<string, string[]>();
+  const depSrcsFor = async (ext: string): Promise<string[]> => {
+    if (!depSrcsCache.has(ext)) depSrcsCache.set(ext, await workspaceDepSrcPaths(input.repoRoot, ext));
+    return depSrcsCache.get(ext)!;
+  };
   const cachedTreeHash = async (ref: string, ext: string): Promise<string | null> => {
-    const key = `${ref}::extensions/${ext}/src`;
+    const key = `${ref}::${ext}`;
     if (treeHashCache.has(key)) return treeHashCache.get(key)!;
-    const h = await gitTreeHash(input.repoRoot, ref, `extensions/${ext}/src`);
+    const h = await closureTreeHash(input.repoRoot, ref, ext, await depSrcsFor(ext));
     treeHashCache.set(key, h);
     return h;
   };
@@ -1162,7 +1245,7 @@ export async function diffExtensions(input: DiffInput): Promise<DiffReport> {
         if (deployedTreeHash === null && !(await commitExists(sourceCommit))) {
           await recoverMissingObjects();
           if (await commitExists(sourceCommit)) {
-            treeHashCache.delete(`${sourceCommit}::extensions/${ext}/src`);
+            treeHashCache.delete(`${sourceCommit}::${ext}`);
             deployedTreeHash = await cachedTreeHash(sourceCommit, ext);
           } else {
             // Commit exists nowhere we can reach — likely squash-orphaned.
@@ -1174,7 +1257,7 @@ export async function diffExtensions(input: DiffInput): Promise<DiffReport> {
           matchesReference = deployedTreeHash === referenceTreeHash;
         }
         if (deployedTreeHash && !matchesReference) {
-          branchHint = await branchHintForTreeHash(input.repoRoot, ext, deployedTreeHash, input.reference);
+          branchHint = await branchHintForTreeHash(input.repoRoot, ext, deployedTreeHash, input.reference, await depSrcsFor(ext));
         }
       }
 
