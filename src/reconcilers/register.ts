@@ -32,6 +32,14 @@ export interface RegisterReconcileInput {
   registerDir: string;
   client: DirectusClient;
   opts: ApplyOptions;
+  // Token for the sql-runner extension (x-sql-runner-token). When present, the
+  // adopt-collection INSERT — the only raw write that carries a manifest's
+  // free-text `note`/`icon` — routes through /sql-runner/execute instead of
+  // /raw-query/execute. raw-query re-splits on ';', so a note containing ';'
+  // is chopped mid-string ("unterminated quoted string") and the table is
+  // never adopted; sql-runner runs the whole statement in one shot (no
+  // re-split). See directus-deploy-cli#51.
+  sqlRunnerToken?: string;
 }
 
 interface RawQueryResult {
@@ -57,6 +65,33 @@ async function rawQuery(
     if (msg.includes(" 404 ")) return { ok: false, data: [], error: "raw-query not available" };
     return { ok: false, data: [], error: msg };
   }
+}
+
+// Run a single write statement. When a sql-runner token is available, send it
+// through /sql-runner/execute (wrap:false) — that endpoint runs the whole
+// string in one shot with no ';' re-splitting, so a note/icon containing ';'
+// stays intact. Otherwise fall back to /raw-query/execute, which is safe only
+// when the statement has no embedded ';' (the caller guards that below).
+// Apostrophes are safe on both paths: sqlLiteral() escapes them to ''.
+async function execWrite(
+  input: RegisterReconcileInput,
+  sql: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (input.sqlRunnerToken) {
+    try {
+      const r = (await input.client.postRaw(
+        "/sql-runner/execute",
+        { sql, wrap: false },
+        { "x-sql-runner-token": input.sqlRunnerToken },
+      )) as { success?: unknown; error?: unknown } | null;
+      if (r && r.success === true) return { ok: true };
+      return { ok: false, error: String(r?.error ?? "sql-runner reported failure") };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
+  }
+  const r = await rawQuery(input.client, sql);
+  return { ok: r.ok, error: r.error };
 }
 
 function metaFor(dataType: string, name: string): { interface: string; special: string[] | null } {
@@ -182,6 +217,25 @@ export async function reconcileRegister(
       const hidden = cm.hidden === true;
       const iconExpr = cm.icon ? sqlLiteral(cm.icon) : "NULL";
       const noteExpr = cm.note ? sqlLiteral(cm.note) : "NULL";
+
+      // Without a sql-runner token the adopt INSERT goes through raw-query,
+      // which splits on ';'. A note/icon carrying ';' would be chopped
+      // mid-string and silently abort adoption. Fail loudly at author time
+      // instead of emitting SQL that breaks on the server. (With a token the
+      // statement runs unsplit, so any ';' is fine.)
+      if (!input.sqlRunnerToken && (cm.note?.includes(";") || cm.icon?.includes(";"))) {
+        results.push({
+          kind: "migrations",
+          label,
+          action: "failed",
+          reason:
+            `collection_meta note/icon contains ';', which the raw-query endpoint splits on — ` +
+            `set SQL_RUNNER_<TARGET>_TOKEN (or SQL_RUNNER_TOKEN) so the adopt INSERT routes ` +
+            `through sql-runner, or remove ';' from the note`,
+        });
+        continue;
+      }
+
       if (input.opts.dryRun) {
         results.push({
           kind: "migrations",
@@ -190,8 +244,8 @@ export async function reconcileRegister(
           reason: "would adopt collection",
         });
       } else {
-        const inserted = await rawQuery(
-          input.client,
+        const inserted = await execWrite(
+          input,
           `INSERT INTO directus_collections (collection, hidden, singleton, icon, note)
            VALUES (${sqlLiteral(table)}, ${hidden}, false, ${iconExpr}, ${noteExpr})
            ON CONFLICT (collection) DO NOTHING`,

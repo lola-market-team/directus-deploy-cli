@@ -77,6 +77,7 @@ export async function run(input: RunInput): Promise<RunReport> {
         registerDir: input.paths.registerDir,
         client: input.client,
         opts: input.opts,
+        sqlRunnerToken: input.sqlRunnerToken,
       })),
     );
   }

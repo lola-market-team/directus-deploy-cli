@@ -156,6 +156,12 @@ migrations/*.sql
 migrations/register/*.json
 ```
 
+> Register manifests: a `collection_meta.note` (or `icon`) containing a `;`
+> requires a sql-runner token (`SQL_RUNNER_<TARGET>_TOKEN`, or `SQL_RUNNER_TOKEN`)
+> so the adopt INSERT runs unsplit — the raw-query fallback splits on `;` and
+> would abort adoption. Apostrophes are always safe (escaped). Without a token,
+> a `;`-bearing note fails at author time with an actionable message.
+
 ## License
 
 MIT

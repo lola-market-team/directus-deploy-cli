@@ -48,6 +48,7 @@ export async function run(input) {
             registerDir: input.paths.registerDir,
             client: input.client,
             opts: input.opts,
+            sqlRunnerToken: input.sqlRunnerToken,
         })));
     }
     // Order matters:

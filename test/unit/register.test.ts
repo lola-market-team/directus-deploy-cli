@@ -112,6 +112,91 @@ describe("reconcileRegister", () => {
     expect(results.some((r) => r.label.includes("adopt") && r.action === "created")).toBe(true);
   });
 
+  it("routes the adopt INSERT through sql-runner when a token is set, preserving ';' in the note", async () => {
+    // directus-deploy-cli#51: raw-query re-splits on ';', chopping a note like
+    // "...listing-file-privacy.ts); the FSM is the sole writer." mid-string
+    // ("unterminated quoted string") so the table is never adopted. With a
+    // sql-runner token the whole INSERT runs unsplit, so the ';' survives.
+    const note = "A hold is the FSM's permission to un-private (hooks/x.ts); the FSM is the sole writer.";
+    const dir = await registerDirWith({
+      "asset_file_privacy_holds.json": {
+        table: "asset_file_privacy_holds",
+        collection_meta: { note },
+      },
+    });
+    const raw = rawQueryStub({ adopted: false });
+    const client = mockClient({
+      postRaw: vi.fn(async (path: string, body: unknown) => {
+        if (path === "/sql-runner/execute") return { success: true };
+        return raw(path, body);
+      }),
+    });
+    const results = await reconcileRegister({
+      registerDir: dir,
+      client,
+      opts: { dryRun: false },
+      sqlRunnerToken: "tok-123",
+    });
+
+    const calls = (client.postRaw as ReturnType<typeof vi.fn>).mock.calls;
+    const runnerCall = calls.find((c) => c[0] === "/sql-runner/execute");
+    expect(runnerCall).toBeDefined();
+    // The full note (';' and all) reaches sql-runner intact, apostrophe escaped.
+    expect(String((runnerCall![1] as { sql: string }).sql)).toContain("the FSM is the sole writer.");
+    expect(String((runnerCall![1] as { sql: string }).sql)).toContain("FSM''s");
+    expect(runnerCall![2]).toMatchObject({ "x-sql-runner-token": "tok-123" });
+    // The INSERT must NOT have gone through raw-query.
+    expect(
+      calls.some((c) => c[0] === "/raw-query/execute" && String((c[1] as { query?: string })?.query).startsWith("INSERT")),
+    ).toBe(false);
+    expect(results.some((r) => r.label.includes("adopt") && r.action === "created")).toBe(true);
+  });
+
+  it("fails loudly on a ';' note when no sql-runner token is available", async () => {
+    // Without a token the adopt INSERT falls back to raw-query, which would
+    // split the note on ';' and silently abort adoption. Fail at author time
+    // with an actionable message instead of emitting SQL that breaks server-side.
+    const dir = await registerDirWith({
+      "asset_file_privacy_holds.json": {
+        table: "asset_file_privacy_holds",
+        collection_meta: { note: "first clause; second clause" },
+      },
+    });
+    const client = mockClient({ postRaw: rawQueryStub({ adopted: false }) });
+    const results = await reconcileRegister({ registerDir: dir, client, opts: { dryRun: false } });
+
+    const failed = results.find((r) => r.action === "failed");
+    expect(failed).toBeDefined();
+    expect(failed!.reason).toMatch(/';'/);
+    expect(failed!.reason).toMatch(/SQL_RUNNER/);
+    // No INSERT was attempted.
+    expect(
+      (client.postRaw as ReturnType<typeof vi.fn>).mock.calls.some(
+        (c) => String((c[1] as { query?: string })?.query).includes("INSERT INTO directus_collections"),
+      ),
+    ).toBe(false);
+  });
+
+  it("adopts a note with an apostrophe (no ';') via raw-query without a token", async () => {
+    // The apostrophe half was never the blocker — sqlLiteral() escapes ' to ''.
+    // A note with an apostrophe but no ';' adopts fine on the raw-query path.
+    const dir = await registerDirWith({
+      "rental_holds.json": {
+        table: "rental_holds",
+        collection_meta: { note: "the FSM's hold record" },
+      },
+    });
+    const client = mockClient({ postRaw: rawQueryStub({ adopted: false }) });
+    const results = await reconcileRegister({ registerDir: dir, client, opts: { dryRun: false } });
+
+    const insert = (client.postRaw as ReturnType<typeof vi.fn>).mock.calls.find(
+      (c) => String((c[1] as { query?: string })?.query).includes("INSERT INTO directus_collections"),
+    );
+    expect(insert).toBeDefined();
+    expect(String((insert![1] as { query: string }).query)).toContain("FSM''s");
+    expect(results.some((r) => r.label.includes("adopt") && r.action === "created")).toBe(true);
+  });
+
   it("still processes ordinary tables alongside a rejected system manifest", async () => {
     // The guard must reject one manifest, not abort the whole run.
     const dir = await registerDirWith({
