@@ -130,6 +130,64 @@ describe("computePromotionQueue commitsBehind (patch-id aware)", () => {
   });
 });
 
+describe("computePromotionQueue — bundled @lola/* package changes (#50)", () => {
+  it("surfaces an extension whose ONLY change is a bundled package's src", async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), "overview-pkg-"));
+    const g = (cmd: string) =>
+      execSync(`git -c user.email=t@t -c user.name=t ${cmd}`, { cwd: repoRoot, encoding: "utf8" }).trim();
+    const w = async (p: string, c: string) => {
+      await mkdir(join(repoRoot, p.slice(0, p.lastIndexOf("/"))), { recursive: true });
+      await writeFile(join(repoRoot, p), c, "utf8");
+    };
+    // chat bundles @lola/comms; comms bundles @lola/events (transitive).
+    await w("extensions/chat/package.json", JSON.stringify({ name: "chat", dependencies: { "@lola/comms": "*" } }));
+    await w("extensions/chat/src/index.ts", "export const v = 1;\n");
+    await w("packages/comms/package.json", JSON.stringify({ name: "@lola/comms", dependencies: { "@lola/events": "*" } }));
+    await w("packages/comms/src/index.ts", "export const c = 1;\n");
+    await w("packages/events/package.json", JSON.stringify({ name: "@lola/events" }));
+    await w("packages/events/src/index.ts", "export const e = 1;\n");
+    g("init -qb master");
+    g("add ."); g("commit -qm base");
+    g("checkout -qb develop");
+    // change ONLY a transitively-bundled package's src — no extensions/chat/src edit
+    await w("packages/events/src/index.ts", "export const e = 2;\n");
+    g("add ."); g("commit -qm 'feat(events pkg): bump'");
+
+    const q = await computePromotionQueue(repoRoot, "develop", "master");
+    // chat must appear as needing promotion even though its own src is untouched
+    expect(q.extensions).toContain("chat");
+    const detail = q.extensionDetails.find((d) => d.name === "chat");
+    expect(detail).toBeDefined();
+    // its expected commit + commit list reflect the package change
+    expect(detail!.commits.length).toBeGreaterThan(0);
+  });
+
+  it("does not invent extensions when an unbundled package changes", async () => {
+    const repoRoot = await mkdtemp(join(tmpdir(), "overview-pkg2-"));
+    const g = (cmd: string) =>
+      execSync(`git -c user.email=t@t -c user.name=t ${cmd}`, { cwd: repoRoot, encoding: "utf8" }).trim();
+    const w = async (p: string, c: string) => {
+      await mkdir(join(repoRoot, p.slice(0, p.lastIndexOf("/"))), { recursive: true });
+      await writeFile(join(repoRoot, p), c, "utf8");
+    };
+    await w("extensions/chat/package.json", JSON.stringify({ name: "chat", dependencies: { "@lola/comms": "*" } }));
+    await w("extensions/chat/src/index.ts", "export const v = 1;\n");
+    await w("packages/comms/package.json", JSON.stringify({ name: "@lola/comms" }));
+    await w("packages/comms/src/index.ts", "export const c = 1;\n");
+    await w("packages/unused/package.json", JSON.stringify({ name: "@lola/unused" }));
+    await w("packages/unused/src/index.ts", "export const u = 1;\n");
+    g("init -qb master");
+    g("add ."); g("commit -qm base");
+    g("checkout -qb develop");
+    await w("packages/unused/src/index.ts", "export const u = 2;\n"); // nobody bundles it
+    g("add ."); g("commit -qm 'chore(unused): bump'");
+
+    const q = await computePromotionQueue(repoRoot, "develop", "master");
+    expect(q.extensions).not.toContain("chat");
+    expect(q.extensions).toEqual([]);
+  });
+});
+
 describe("resolvePromotionPair", () => {
   const dev = { ref: "origin/develop", buildForbidden: false };
   const prod = { ref: "origin/master", buildForbidden: true };

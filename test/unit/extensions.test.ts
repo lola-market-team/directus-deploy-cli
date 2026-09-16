@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pushExtension, promoteExtension, statusExtensions, workspaceDepSrcPaths } from "../../src/extensions.js";
+import { pushExtension, promoteExtension, statusExtensions, workspaceDepSrcPaths, extensionsByBundledPackage } from "../../src/extensions.js";
 
 async function scratchRepo(files: Record<string, string>): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "ext-"));
@@ -260,5 +260,32 @@ describe("workspaceDepSrcPaths (#50 — artifact key sees bundled @lola/* packag
       "extensions/plain/package.json": pkg("plain-ext", { "left-pad": "1" }),
     });
     expect(await workspaceDepSrcPaths(root, "plain")).toEqual([]);
+  });
+});
+
+describe("extensionsByBundledPackage (#50 — reverse dep map for overview)", () => {
+  const pkg = (name: string, deps: Record<string, string> = {}) =>
+    JSON.stringify({ name, dependencies: deps });
+
+  it("maps each package base to the extensions that transitively bundle it", async () => {
+    const root = await scratchRepo({
+      "extensions/chat/package.json": pkg("chat", { "@lola/comms": "*" }),
+      "extensions/community/package.json": pkg("community", { "@lola/comms": "*" }),
+      "extensions/map/package.json": pkg("map", { "@lola/geo": "*" }),
+      // comms transitively bundles events
+      "packages/comms/package.json": pkg("@lola/comms", { "@lola/events": "*" }),
+      "packages/events/package.json": pkg("@lola/events"),
+      "packages/geo/package.json": pkg("@lola/geo"),
+    });
+    const m = await extensionsByBundledPackage(root);
+    expect(m.get("comms")).toEqual(["chat", "community"]);
+    expect(m.get("events")).toEqual(["chat", "community"]); // transitive through comms
+    expect(m.get("geo")).toEqual(["map"]);
+    expect(m.has("unused")).toBe(false);
+  });
+
+  it("returns an empty map when there is no packages/ or extensions/", async () => {
+    const root = await scratchRepo({ "readme.md": "x" });
+    expect((await extensionsByBundledPackage(root)).size).toBe(0);
   });
 });
