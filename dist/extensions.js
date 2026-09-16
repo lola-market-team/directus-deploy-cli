@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 // Extension deploy over plain SSH.
@@ -43,6 +44,44 @@ async function assertCommand(cmd, args, opts = {}) {
     }
     return r;
 }
+// Repo-relative `src` dirs of every workspace package the extension
+// TRANSITIVELY depends on. These are BUNDLED into the extension's dist by the
+// build, so a change to any of them changes the shipped artifact — yet the
+// commit resolvers historically scoped only to `extensions/<name>/src`, so
+// such a change left the source commit (hence the artifact filename AND the
+// stamped /_meta.sourceCommit) unchanged, and a stale bundle shipped silently
+// (directus-deploy-cli#50). Folding these paths into the git-log path set makes
+// the key sensitive to everything that ends up in the bundle.
+//
+// `@lola/<x>` maps to `packages/<x>` by convention — the SAME mapping the
+// backend's scripts/ext-build-paths.mjs (the source of truth for the bash
+// build/deploy path and the build-info stamper) uses. Both sides MUST resolve
+// the identical path set or verifyMeta mismatches on a package-only change, so
+// they share this convention rather than one reading package.json `name`.
+export async function workspaceDepSrcPaths(repoRoot, extName) {
+    const seen = new Set(); // package base names, e.g. "comms"
+    async function visit(pkgJsonPath) {
+        let pkg;
+        try {
+            pkg = JSON.parse(await readFile(pkgJsonPath, "utf8"));
+        }
+        catch {
+            return;
+        }
+        const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+        for (const name of Object.keys(deps)) {
+            if (!name.startsWith("@lola/"))
+                continue;
+            const base = name.slice("@lola/".length);
+            if (seen.has(base))
+                continue;
+            seen.add(base);
+            await visit(join(repoRoot, "packages", base, "package.json"));
+        }
+    }
+    await visit(join(repoRoot, "extensions", extName, "package.json"));
+    return [...seen].sort().map((base) => `packages/${base}/src`);
+}
 async function resolveSourceCommit(repoRoot, extName) {
     // Match packages/build-info/bin/stamp-build-info.mjs — the stamper is the
     // source of truth for what ends up in /_meta.sourceCommit. Both scoped
@@ -51,6 +90,13 @@ async function resolveSourceCommit(repoRoot, extName) {
     // that verifyMeta could never resolve — this was the actual bug behind
     // the "chokidar reload false-negative" theory (runs 29525123627,
     // 29523531092, 29524916438 on 2026-07-16).
+    //
+    // Also scoped to the `src/` of every workspace package the extension bundles
+    // (#50) — the stamper does the identical widening, so the two stay equal and
+    // verifyMeta keeps matching. This pathspec is byte-identical to what the
+    // backend's scripts/ext-build-paths.mjs emits (ext src, build-info excluded,
+    // then the sorted package srcs), which the stamper and bash deploy path use.
+    const depSrcs = await workspaceDepSrcPaths(repoRoot, extName);
     const r = await assertCommand("git", [
         "-C",
         repoRoot,
@@ -59,6 +105,8 @@ async function resolveSourceCommit(repoRoot, extName) {
         "--format=%H",
         "--",
         `extensions/${extName}/src`,
+        `:!extensions/${extName}/src/build-info.ts`,
+        ...depSrcs,
     ], { label: "git log source commit" });
     const commit = r.stdout.trim();
     if (!commit)
@@ -349,6 +397,12 @@ async function resolveArtifactSourceCommit(repoRoot, extName) {
     // Match scripts/build-extension.sh: last commit touching extensions/<name>/,
     // EXCLUDING dist/ (build output) and the stamped build-info placeholder.
     // Short (%h) — that's what the artifact filename uses in the bucket.
+    //
+    // Plus the src/ of every bundled workspace package (#50): without this, a
+    // change to a bundled @lola/* package leaves this key unchanged, so
+    // publishTarball finds the same <sha>.tgz already in the bucket and reuses
+    // the STALE artifact — the new package code never ships.
+    const depSrcs = await workspaceDepSrcPaths(repoRoot, extName);
     const r = await assertCommand("git", [
         "-C",
         repoRoot,
@@ -357,6 +411,7 @@ async function resolveArtifactSourceCommit(repoRoot, extName) {
         "--format=%h",
         "--",
         `extensions/${extName}`,
+        ...depSrcs,
         `:!extensions/${extName}/dist`,
         `:!extensions/${extName}/src/build-info.ts`,
     ], { label: "git log artifact source commit" });
@@ -367,7 +422,11 @@ async function resolveArtifactSourceCommit(repoRoot, extName) {
 }
 async function worktreeDirty(repoRoot, extName) {
     // Uncommitted changes under the extension, excluding dist/ + build-info.ts.
-    // Same scope as build-extension.sh's --allow-dirty check.
+    // Same scope as build-extension.sh's --allow-dirty check. Bundled workspace
+    // package src/ counts too (#50): a dirty package is bundled into the artifact
+    // just like dirty ext src, so it equally makes the published artifact
+    // non-reproducible from a commit.
+    const depSrcs = await workspaceDepSrcPaths(repoRoot, extName);
     const r = await runCommand("git", [
         "-C",
         repoRoot,
@@ -375,6 +434,7 @@ async function worktreeDirty(repoRoot, extName) {
         "--porcelain",
         "--",
         `extensions/${extName}`,
+        ...depSrcs,
         `:!extensions/${extName}/dist`,
         `:!extensions/${extName}/src/build-info.ts`,
     ]);

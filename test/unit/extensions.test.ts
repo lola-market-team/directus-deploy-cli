@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pushExtension, promoteExtension, statusExtensions } from "../../src/extensions.js";
+import { pushExtension, promoteExtension, statusExtensions, workspaceDepSrcPaths } from "../../src/extensions.js";
 
 async function scratchRepo(files: Record<string, string>): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "ext-"));
@@ -205,5 +205,60 @@ describe("statusExtensions", () => {
     expect(rows[0]!.name).toBe("chat");
     expect(rows[0]!.error).toBeDefined();
     expect(rows[0]!.sourceCommit).toBeNull();
+  });
+});
+
+describe("workspaceDepSrcPaths (#50 — artifact key sees bundled @lola/* packages)", () => {
+  const pkg = (name: string, deps: Record<string, string> = {}) =>
+    JSON.stringify({ name, dependencies: deps });
+
+  it("resolves direct @lola/* deps to their packages/<dir>/src", async () => {
+    const root = await scratchRepo({
+      "extensions/chat/package.json": pkg("chat-ext", { "@lola/comms": "*", "left-pad": "1" }),
+      "packages/comms/package.json": pkg("@lola/comms"),
+    });
+    expect(await workspaceDepSrcPaths(root, "chat")).toEqual(["packages/comms/src"]);
+  });
+
+  it("follows transitive @lola/* deps", async () => {
+    // community → comms → events; events reached only through comms.
+    const root = await scratchRepo({
+      "extensions/community/package.json": pkg("community-ext", { "@lola/comms": "*" }),
+      "packages/comms/package.json": pkg("@lola/comms", { "@lola/events": "*" }),
+      "packages/events/package.json": pkg("@lola/events"),
+    });
+    expect(await workspaceDepSrcPaths(root, "community")).toEqual([
+      "packages/comms/src",
+      "packages/events/src",
+    ]);
+  });
+
+  it("maps @lola/<x> to packages/<x> by convention (matching backend ext-build-paths.mjs)", async () => {
+    // Both sides MUST use the same @lola/<x> → packages/<x> mapping or the key
+    // diverges and verifyMeta mismatches. A non-@lola dep is ignored.
+    const root = await scratchRepo({
+      "extensions/map/package.json": pkg("map-ext", { "@lola/mapgrid": "*", "left-pad": "1" }),
+      "packages/mapgrid/package.json": pkg("@lola/mapgrid"),
+    });
+    expect(await workspaceDepSrcPaths(root, "map")).toEqual(["packages/mapgrid/src"]);
+  });
+
+  it("survives dependency cycles without looping", async () => {
+    const root = await scratchRepo({
+      "extensions/x/package.json": pkg("x-ext", { "@lola/a": "*" }),
+      "packages/a/package.json": pkg("@lola/a", { "@lola/b": "*" }),
+      "packages/b/package.json": pkg("@lola/b", { "@lola/a": "*" }),
+    });
+    expect((await workspaceDepSrcPaths(root, "x")).sort()).toEqual([
+      "packages/a/src",
+      "packages/b/src",
+    ]);
+  });
+
+  it("returns [] when the extension bundles no workspace packages", async () => {
+    const root = await scratchRepo({
+      "extensions/plain/package.json": pkg("plain-ext", { "left-pad": "1" }),
+    });
+    expect(await workspaceDepSrcPaths(root, "plain")).toEqual([]);
   });
 });
