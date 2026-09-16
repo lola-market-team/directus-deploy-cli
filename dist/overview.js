@@ -622,6 +622,8 @@ export async function runOverview(input) {
     });
     let promotion = null;
     let promotionSkipped;
+    let envParity = null;
+    let envSkipped;
     let pair;
     if (input.from && input.to) {
         pair = { from: input.from, to: input.to };
@@ -658,8 +660,28 @@ export async function runOverview(input) {
                 : e.message;
         }
     })();
+    const envPromise = (async () => {
+        if (!cfg.env_check) {
+            envSkipped = "no env_check in targets file";
+            return;
+        }
+        input.onProgress?.({ target: "repo", stage: "env", status: "start", detail: "env parity" });
+        const t0 = Date.now();
+        try {
+            const r = await withDeadline("env parity", timeoutMs, exec("sh", ["-c", cfg.env_check], repoRoot, timeoutMs));
+            const line = r.stdout.trim().split("\n").filter(Boolean).pop() ?? "";
+            const parsed = JSON.parse(line);
+            envParity = { source: parsed.source, findings: parsed.findings ?? [], ok: Boolean(parsed.ok) };
+            input.onProgress?.({ target: "repo", stage: "env", status: "ok", ms: Date.now() - t0 });
+        }
+        catch (e) {
+            envSkipped = e.message;
+            input.onProgress?.({ target: "repo", stage: "env", status: isTimeout(e) ? "timeout" : "error", ms: Date.now() - t0, detail: e.message });
+        }
+    })();
     const targets = await Promise.all(targetChecks);
     await promotionPromise;
+    await envPromise;
     // Release preview join: what does the destination currently run? A probed
     // target deployed from the `to` ref already fetched /_meta sourceCommit
     // for every extension — reuse it, no extra network.
@@ -679,7 +701,7 @@ export async function runOverview(input) {
     for (const p of matCache.values()) {
         p.then((dir) => rm(dir, { recursive: true, force: true })).catch(() => { });
     }
-    return { targets, promotion, promotionSkipped };
+    return { targets, promotion, promotionSkipped, env: envParity, envSkipped };
 }
 // -------------------- rendering --------------------
 function isErr(d) {
@@ -860,6 +882,18 @@ export function renderOverview(report) {
     }
     else if (report.promotionSkipped) {
         lines.push(`  (promotion column skipped: ${report.promotionSkipped})`);
+    }
+    if (report.env) {
+        lines.push("");
+        lines.push(report.env.ok
+            ? `  env parity (${report.env.source ?? "?"}): OK — no cross-env violations`
+            : `  env parity (${report.env.source ?? "?"}): ${report.env.findings.length} finding(s)`);
+        for (const f of report.env.findings)
+            lines.push(`    ✗ ${f}`);
+    }
+    else if (report.envSkipped) {
+        lines.push("");
+        lines.push(`  (env parity skipped: ${report.envSkipped})`);
     }
     const anyDrift = hasDrift(report);
     const anyErr = hasErrors(report);

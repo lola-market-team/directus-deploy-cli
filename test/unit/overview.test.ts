@@ -258,6 +258,22 @@ describe("extensions cell: unverifiable is not clean", () => {
     expect(out).toMatch(/✓ 23\/23 match/);
   });
 
+  it("renders an env-parity OK line", () => {
+    const out = renderOverview({ targets: [target(23, 0, 0)], promotion, env: { source: "secret-manager", findings: [], ok: true } });
+    expect(out).toMatch(/env parity \(secret-manager\): OK/);
+  });
+
+  it("renders env-parity findings and count", () => {
+    const out = renderOverview({ targets: [target(23, 0, 0)], promotion, env: { source: "secret-manager", findings: ["COLLISION DB_PASSWORD: identical in test and prod"], ok: false } });
+    expect(out).toMatch(/env parity \(secret-manager\): 1 finding/);
+    expect(out).toMatch(/COLLISION DB_PASSWORD/);
+  });
+
+  it("renders env-parity skip reason", () => {
+    const out = renderOverview({ targets: [target(23, 0, 0)], promotion, envSkipped: "no env_check in targets file" });
+    expect(out).toMatch(/env parity skipped: no env_check/);
+  });
+
   it("real drift still wins over unverifiable", () => {
     const out = renderOverview({ targets: [target(20, 2, 1)], promotion });
     expect(out).toMatch(/✗ 2 behind/);

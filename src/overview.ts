@@ -435,10 +435,18 @@ export interface TargetOverview {
   probes: Record<string, Dimension<ProbeSummary>>;
 }
 
+export interface EnvParity {
+  source?: string;      // "secret-manager" | "env-files"
+  findings: string[];   // ["COLLISION ...", "DRIFT ...", "MISSING ..."]
+  ok: boolean;
+}
+
 export interface OverviewReport {
   targets: TargetOverview[];
   promotion: PromotionQueue | null;
   promotionSkipped?: string; // why the promotion column is absent
+  env?: EnvParity | null;    // cross-env parity (env_check), null when not configured
+  envSkipped?: string;       // why the env section is absent
 }
 
 const CONFIG_ENTITIES: EntityKind[] = [
@@ -790,6 +798,8 @@ export async function runOverview(input: OverviewInput): Promise<OverviewReport>
 
   let promotion: PromotionQueue | null = null;
   let promotionSkipped: string | undefined;
+  let envParity: EnvParity | null = null;
+  let envSkipped: string | undefined;
   let pair: { from: string; to: string; fallback?: string } | { skipped: string };
   if (input.from && input.to) {
     pair = { from: input.from, to: input.to };
@@ -824,8 +834,25 @@ export async function runOverview(input: OverviewInput): Promise<OverviewReport>
     }
   })();
 
+  const envPromise = (async () => {
+    if (!cfg.env_check) { envSkipped = "no env_check in targets file"; return; }
+    input.onProgress?.({ target: "repo", stage: "env", status: "start", detail: "env parity" });
+    const t0 = Date.now();
+    try {
+      const r = await withDeadline("env parity", timeoutMs, exec("sh", ["-c", cfg.env_check], repoRoot, timeoutMs));
+      const line = r.stdout.trim().split("\n").filter(Boolean).pop() ?? "";
+      const parsed = JSON.parse(line) as EnvParity;
+      envParity = { source: parsed.source, findings: parsed.findings ?? [], ok: Boolean(parsed.ok) };
+      input.onProgress?.({ target: "repo", stage: "env", status: "ok", ms: Date.now() - t0 });
+    } catch (e) {
+      envSkipped = (e as Error).message;
+      input.onProgress?.({ target: "repo", stage: "env", status: isTimeout(e) ? "timeout" : "error", ms: Date.now() - t0, detail: (e as Error).message });
+    }
+  })();
+
   const targets = await Promise.all(targetChecks);
   await promotionPromise;
+  await envPromise;
 
   // Release preview join: what does the destination currently run? A probed
   // target deployed from the `to` ref already fetched /_meta sourceCommit
@@ -847,7 +874,7 @@ export async function runOverview(input: OverviewInput): Promise<OverviewReport>
     p.then((dir) => rm(dir, { recursive: true, force: true })).catch(() => {});
   }
 
-  return { targets, promotion, promotionSkipped };
+  return { targets, promotion, promotionSkipped, env: envParity, envSkipped };
 }
 
 // -------------------- rendering --------------------
@@ -1015,6 +1042,19 @@ export function renderOverview(report: OverviewReport): string {
     if (promoDetails.length) lines.push(...promoDetails.map((d) => `  ${d}`));
   } else if (report.promotionSkipped) {
     lines.push(`  (promotion column skipped: ${report.promotionSkipped})`);
+  }
+
+  if (report.env) {
+    lines.push("");
+    lines.push(
+      report.env.ok
+        ? `  env parity (${report.env.source ?? "?"}): OK — no cross-env violations`
+        : `  env parity (${report.env.source ?? "?"}): ${report.env.findings.length} finding(s)`,
+    );
+    for (const f of report.env.findings) lines.push(`    ✗ ${f}`);
+  } else if (report.envSkipped) {
+    lines.push("");
+    lines.push(`  (env parity skipped: ${report.envSkipped})`);
   }
 
   const anyDrift = hasDrift(report);

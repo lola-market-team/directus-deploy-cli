@@ -10,6 +10,11 @@ export interface TargetsFile {
   // name, {target} → target name. The command must print one JSON line:
   //   { "clean": true|false, "summary": "…" }   (or { "error": "…" })
   drift_probes?: Array<{ name: string; cmd: string }>;
+
+  // Cross-env parity check: a command printing one JSON line
+  //   { "ok": true|false, "findings": ["..."], "source"?: "..." }
+  // Rendered by `overview` as an env-parity section (e.g. `node scripts/env-diff.mjs --json`).
+  env_check?: string;
 }
 
 export interface TargetConfig {
