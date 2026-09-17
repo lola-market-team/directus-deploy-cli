@@ -66,7 +66,7 @@ export interface PushResult {
 function runCommand(
   cmd: string,
   args: string[],
-  opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv; input?: string } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((res, rej) => {
     const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env ?? process.env });
@@ -76,6 +76,11 @@ function runCommand(
     child.stderr.on("data", (d) => (stderr += d.toString()));
     child.on("error", (e) => rej(e));
     child.on("close", (code) => res({ code: code ?? -1, stdout, stderr }));
+    if (opts.input !== undefined) {
+      child.stdin.on("error", () => {}); // ignore EPIPE if the child exits early
+      child.stdin.write(opts.input);
+      child.stdin.end();
+    }
   });
 }
 
@@ -1107,10 +1112,44 @@ async function closureTreeHash(
   return createHash("sha256").update(parts.sort().join("\n")).digest("hex");
 }
 
+// Resolve many `<ref>:<path>` object ids in ONE `git cat-file --batch-check`
+// process. Output is line-for-line with the queries: an existing object prints
+// `<oid> <type> <size>`, a missing one prints `<input> missing` — either way
+// exactly one line per query, so we map back by index. Returns oid (40/64 hex)
+// or null. This is the batched primitive that keeps branchHintForTreeHash from
+// spawning (1 + deps) × branches git processes (see below).
+async function batchObjectIds(
+  repoRoot: string,
+  queries: string[],
+): Promise<Map<string, string | null>> {
+  const out = new Map<string, string | null>();
+  if (queries.length === 0) return out;
+  const r = await runCommand(
+    "git",
+    ["-C", repoRoot, "cat-file", "--batch-check"],
+    { input: queries.join("\n") + "\n" },
+  );
+  const lines = r.stdout.split("\n");
+  queries.forEach((q, i) => {
+    const m = (lines[i] ?? "").trim().match(/^([0-9a-f]{40,64}) \S+ \d+$/);
+    out.set(q, m ? m[1]! : null);
+  });
+  return out;
+}
+
 // When content differs, we still want a hint about what's running. Prefer
 // a branch that has EXACTLY the same tree hash for this ext — that identifies
 // the WIP branch directly, without listing every branch that happens to
 // contain the SHA in its history. Falls back to null when nothing matches.
+//
+// PERF: this compares the deployed closure hash against every remote branch.
+// Resolving each branch's closure via closureTreeHash() spawned one git process
+// per (branch × path) — (1 + deps) × N-branches subprocesses, serially — which
+// turned overview's extensions leg into minutes once the closure went
+// dependency-aware (#54) across a repo with ~200 remote branches. Instead we
+// resolve every (branch:path) object id in a SINGLE cat-file --batch-check and
+// fold the closure hashes in memory, reproducing closureTreeHash's digest
+// exactly. Two git spawns total, regardless of branch or dep count.
 async function branchHintForTreeHash(
   repoRoot: string,
   ext: string,
@@ -1125,12 +1164,23 @@ async function branchHintForTreeHash(
     .split("\n")
     .map((s) => s.trim())
     .filter((s) => s.length > 0 && !s.endsWith("/HEAD") && s !== `refs/remotes/${reference.replace(/^origin\//, "origin/")}`);
+  if (branches.length === 0) return null;
 
-  // Same closure hash cachedTreeHash uses, or a branch that only differs in a
-  // bundled package would never match the deployed closure hash.
+  const extSrc = `extensions/${ext}/src`;
+  const paths = [extSrc, ...depSrcs];
+  // One cat-file for every (branch × closure-path) lookup.
+  const ids = await batchObjectIds(
+    repoRoot,
+    branches.flatMap((b) => paths.map((p) => `${b}:${p}`)),
+  );
+
+  // Same closure hash cachedTreeHash/closureTreeHash use, folded in memory —
+  // a branch that only differs in a bundled package must still not match.
   const matches: string[] = [];
   for (const ref of branches) {
-    const h = await closureTreeHash(repoRoot, ref, ext, depSrcs);
+    if (!ids.get(`${ref}:${extSrc}`)) continue; // extension absent at this ref
+    const parts = paths.map((p) => `${p}=${ids.get(`${ref}:${p}`) ?? "absent"}`);
+    const h = createHash("sha256").update(parts.sort().join("\n")).digest("hex");
     if (h === treeHash) matches.push(ref.replace(/^refs\/remotes\//, ""));
   }
   if (matches.length === 0) return null;
